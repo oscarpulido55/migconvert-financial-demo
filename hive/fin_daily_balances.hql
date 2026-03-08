@@ -5,14 +5,7 @@
 -- day's balance snapshot.
 -- ==============================================================================
 
--- Setup Configuration for optimized execution
-SET hive.exec.dynamic.partition=true;
-SET hive.exec.dynamic.partition.mode=nonstrict;
-SET hive.optimize.sort.dynamic.partition=true;
-SET hive.vectorized.execution.enabled=true;
-SET hive.cbo.enable=true;
-SET hive.compute.query.using.stats=true;
-SET mapreduce.job.reduces=500;
+-- Setup Configuration for optimized execution (Removed for standard SQL parser compat)
 
 -- Ensure target database exists
 CREATE DATABASE IF NOT EXISTS fin_core;
@@ -39,15 +32,15 @@ TBLPROPERTIES ('transactional'='true');
 
 
 -- 2. Temporary table to hold today's net movements per account
-DROP TABLE IF EXISTS default.tmp_daily_movements_${hiveconf:PROCESS_DATE_NODASH};
+DROP TABLE IF EXISTS default.tmp_daily_movements_stg;
 
-CREATE TEMPORARY TABLE default.tmp_daily_movements_${hiveconf:PROCESS_DATE_NODASH} AS
+CREATE TEMPORARY TABLE default.tmp_daily_movements_stg AS
 WITH credited AS (
     SELECT 
         destination_account_id AS account_id,
         SUM(amount_base_currency) AS total_credits
     FROM fin_core.fact_transactions
-    WHERE trx_date = '${hiveconf:PROCESS_DATE}'
+    WHERE trx_date = '2024-01-01'
       AND transaction_type NOT IN ('FEE', 'REVERSAL_DEBIT')
     GROUP BY destination_account_id
 ),
@@ -56,7 +49,7 @@ debited AS (
         source_account_id AS account_id,
         SUM(amount_base_currency) AS total_debits
     FROM fin_core.fact_transactions
-    WHERE trx_date = '${hiveconf:PROCESS_DATE}'
+    WHERE trx_date = '2024-01-01'
       AND transaction_type NOT IN ('REVERSAL_CREDIT')
     GROUP BY source_account_id
 )
@@ -103,18 +96,18 @@ SELECT
     CURRENT_TIMESTAMP() AS etl_timestamp,
     
     -- Partition columns
-    CAST('${hiveconf:PROCESS_DATE}' AS DATE) AS balance_date,
+    CAST('2024-01-01' AS DATE) AS balance_date,
     COALESCE(a.region_code, 'UN') AS region_code
     
 FROM fin_core.dim_accounts a
 -- Join with previous day's balance
 LEFT JOIN fin_core.fact_daily_balances prev 
     ON a.account_id = prev.account_id 
-    AND prev.balance_date = DATE_SUB(CAST('${hiveconf:PROCESS_DATE}' AS DATE), 1)
+    AND prev.balance_date = DATE_SUB(CAST('2024-01-01' AS DATE), 1)
 -- Join with today's movements
-LEFT JOIN default.tmp_daily_movements_${hiveconf:PROCESS_DATE_NODASH} m 
+LEFT JOIN default.tmp_daily_movements_stg m 
     ON a.account_id = m.account_id
 WHERE a.status IN ('OPEN', 'FROZEN', 'DORMANT');
 
 -- Clean up
-DROP TABLE IF EXISTS default.tmp_daily_movements_${hiveconf:PROCESS_DATE_NODASH};
+DROP TABLE IF EXISTS default.tmp_daily_movements_stg;

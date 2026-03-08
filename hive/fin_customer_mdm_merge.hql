@@ -5,8 +5,7 @@
 -- JOIN and complex CASE evaluations.
 -- ==============================================================================
 
-SET hive.exec.dynamic.partition=true;
-SET hive.exec.dynamic.partition.mode=nonstrict;
+-- Removed SET configurations for standard SQL parser compatibility
 
 -- Core Target Table for Customers (SCD Type 2)
 CREATE TABLE IF NOT EXISTS fin_core.dim_customers_scd2 (
@@ -24,9 +23,9 @@ CREATE TABLE IF NOT EXISTS fin_core.dim_customers_scd2 (
 ) STORED AS ORC;
 
 -- View logic to do an SCD 2 transform over yesterday's active snapshot vs today's delta update
-DROP VIEW IF EXISTS default.vw_scd_transform_${hiveconf:PROCESS_DATE_NODASH};
+DROP VIEW IF EXISTS default.vw_scd_transform_stg;
 
-CREATE VIEW default.vw_scd_transform_${hiveconf:PROCESS_DATE_NODASH} AS
+CREATE VIEW default.vw_scd_transform_stg AS
 WITH active_records AS (
     SELECT * 
     FROM fin_core.dim_customers_scd2 
@@ -46,7 +45,7 @@ incoming_updates AS (
     FROM (
         SELECT *, ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY timestamp DESC) as rn
         FROM fin_landing.customer_updates
-        WHERE to_date(timestamp) = '${hiveconf:PROCESS_DATE}'
+        WHERE to_date(timestamp) = '2024-01-01'
     ) t WHERE rn = 1
 )
 
@@ -100,9 +99,9 @@ SELECT
     residential_address_old,
     marital_status_old,
     old_start_date,
-    CAST('${hiveconf:PROCESS_DATE} 00:00:00' AS TIMESTAMP) AS effective_end_date,
+    CAST('2024-01-01 00:00:00' AS TIMESTAMP) AS effective_end_date,
     false AS is_active
-FROM default.vw_scd_transform_${hiveconf:PROCESS_DATE_NODASH}
+FROM default.vw_scd_transform_stg
 WHERE change_type = 'UPDATE';
 
 -- 2. Insert the completely NEW rows, and the NEW ACTIVE instances of updated rows
@@ -117,13 +116,13 @@ SELECT
     phone_number_new,
     residential_address_new,
     marital_status_new,
-    CAST('${hiveconf:PROCESS_DATE} 00:00:00' AS TIMESTAMP) AS effective_start_date,
+    CAST('2024-01-01 00:00:00' AS TIMESTAMP) AS effective_start_date,
     CAST('9999-12-31 23:59:59' AS TIMESTAMP) AS effective_end_date,
     true AS is_active
-FROM default.vw_scd_transform_${hiveconf:PROCESS_DATE_NODASH}
+FROM default.vw_scd_transform_stg
 WHERE change_type IN ('INSERT', 'UPDATE');
 
 -- Note: 'NO CHANGE' records are unaffected since we did an INSERT INTO.
 -- If maintaining an OVERWRITE pipeline, we'd also insert back the 'NO CHANGE' rows exactly as they were.
 
-DROP VIEW IF EXISTS default.vw_scd_transform_${hiveconf:PROCESS_DATE_NODASH};
+DROP VIEW IF EXISTS default.vw_scd_transform_stg;

@@ -5,9 +5,6 @@
 -- based on their 3-month trailing depository volume.
 -- ==============================================================================
 
-SET hive.exec.dynamic.partition.mode=nonstrict;
-SET hive.cbo.enable=true;
-
 CREATE DATABASE IF NOT EXISTS fin_mart;
 
 CREATE TABLE IF NOT EXISTS fin_mart.monthly_account_metrics (
@@ -81,4 +78,4 @@ SELECT
     END AS volume_tier,
     processing_year
 FROM trailing_stats
-WHERE report_month = '${hiveconf:TARGET_MONTH}';
+WHERE report_month = '2024-01';

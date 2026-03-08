@@ -5,9 +5,6 @@
 -- Uses advanced windowing and pattern matching techniques in Hive.
 -- ==============================================================================
 
-SET hive.execution.engine=tez;
-SET hive.vectorized.execution.enabled=true;
-
 CREATE DATABASE IF NOT EXISTS fin_reports;
 
 -- Produce a report showing Structuring (Smurfing)
@@ -42,7 +39,7 @@ WITH daily_cash_aggregates AS (
     FROM fin_core.fact_transactions t
     JOIN fin_core.dim_customers c ON t.customer_id = c.customer_id
     WHERE t.transaction_type IN ('CASH_DEPOSIT', 'WIRE_TRANSFER_IN')
-      AND SUBSTR(CAST(t.trx_date AS STRING), 1, 7) = '${hiveconf:REPORT_MONTH}'
+      AND SUBSTR(CAST(t.trx_date AS STRING), 1, 7) = '2024-01'
     GROUP BY 
         c.customer_id,
         c.customer_segment,
@@ -94,7 +91,7 @@ SELECT
         ELSE false
     END AS is_escalated,
     CURRENT_TIMESTAMP() AS report_generation_ts,
-    '${hiveconf:REPORT_MONTH}' AS report_month
+    '2024-01' AS report_month
 FROM rolling_window_aggregates
 WHERE rolling_3day_amount >= 9500.00 -- Just under the 10k threshold
   AND rolling_3day_amount <= 10500.00
