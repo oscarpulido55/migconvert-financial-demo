@@ -5,8 +5,6 @@
 -- day's balance snapshot.
 -- ==============================================================================
 
--- Setup Configuration for optimized execution (Removed for standard SQL parser compat)
-
 -- Ensure target database exists
 CREATE DATABASE IF NOT EXISTS fin_core;
 

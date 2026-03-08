@@ -5,8 +5,6 @@
 -- JOIN and complex CASE evaluations.
 -- ==============================================================================
 
--- Removed SET configurations for standard SQL parser compatibility
-
 -- Core Target Table for Customers (SCD Type 2)
 CREATE TABLE IF NOT EXISTS fin_core.dim_customers_scd2 (
     customer_surrogate_key STRING,
