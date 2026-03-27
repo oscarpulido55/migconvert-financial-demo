@@ -6,11 +6,11 @@ from pyspark.sql.types import DoubleType, IntegerType, StringType
 from pyspark.sql.window import Window
 
 def create_spark_session():
-    """Initializes and returns a Spark session with Hive Metastore support."""
+    """Initializes and returns a Spark session with BigQuery connector support.""" # Major Change: Updated comment for BigQuery support.
     return SparkSession.builder \
         .appName("Financial_Credit_Card_Fraud_Scoring") \
-        .enableHiveSupport() \
-        .getOrCreate()
+        .config("spark.jars.packages", "com.google.cloud.spark:spark-bigquery-with-dependencies_2.12:0.36.1") \
+        .getOrCreate() # Major Change: Replaced .enableHiveSupport() with .config() for BigQuery connector. Ensure version is compatible with your environment.
 
 # Create a custom UDF for great circle distance
 def haversine(lat1, lon1, lat2, lon2):
@@ -33,9 +33,9 @@ def score_transactions_for_fraud(spark, execution_date):
     """
     
     # 1. Load Data
-    full_cc_trx = spark.table("fin_core.cc_transactions")
-    accounts = spark.table("fin_core.dim_accounts")
-    merchants = spark.table("fin_core.dim_merchants")
+    full_cc_trx = spark.read.format("bigquery").option("table", "your_gcp_project_id.your_core_dataset.cc_transactions").load() # Major Change: Replaced spark.table() for Hive with spark.read.format("bigquery").option("table", ...).load() for BigQuery. Replace 'your_gcp_project_id' and 'your_core_dataset' with your actual Google Cloud Project ID and BigQuery Dataset.
+    accounts = spark.read.format("bigquery").option("table", "your_gcp_project_id.your_core_dataset.dim_accounts").load() # Major Change: See comment above.
+    merchants = spark.read.format("bigquery").option("table", "your_gcp_project_id.your_core_dataset.dim_merchants").load() # Major Change: See comment above.
     
     # 2. Extract current day transactions
     cc_trx = full_cc_trx.filter(col("trx_date") == execution_date)
@@ -105,7 +105,7 @@ def score_transactions_for_fraud(spark, execution_date):
     
     final_output.write \
         .mode("append") \
-        .insertInto("fin_mart.fraud_scores_daily")
+        .format("bigquery").option("table", "your_gcp_project_id.your_mart_dataset.fraud_scores_daily").save() # Major Change: Replaced .insertInto() for Hive with .format("bigquery").option("table", ...).save() for BigQuery. Replace 'your_gcp_project_id' and 'your_mart_dataset' with your actual Google Cloud Project ID and BigQuery Dataset.
     
     print(f"Pure DataFrame Fraud scoring completed for {execution_date}")
 

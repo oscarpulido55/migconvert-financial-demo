@@ -4,14 +4,15 @@ from pyspark.sql.window import Window
 from pyspark.sql.types import StringType, DoubleType, IntegerType, StructType, StructField, ArrayType
 
 def get_spark_session():
-    """Initializes and returns a Spark session with Hive support enabled."""
+    """Initializes and returns a Spark session with BigQuery support enabled.""" # Modified docstring for BigQuery context.
     return SparkSession.builder \
         .appName("Financial_Customer_Onboarding_ETL") \
-        .enableHiveSupport() \
+        # Removed .enableHiveSupport() as BigQuery uses a different integration mechanism via the Spark-BigQuery connector.
         .config("spark.sql.sources.partitionOverwriteMode", "dynamic") \
         .config("spark.sql.adaptive.enabled", "true") \
         .config("spark.sql.adaptive.coalescePartitions.enabled", "true") \
-        .getOrCreate()
+        .config("temporaryGcsBucket", "your-gcs-temp-bucket") \
+        .getOrCreate() # Added configuration for 'temporaryGcsBucket', which is required by the Spark-BigQuery connector for temporary data during writes. Replace with an actual GCS bucket.
 
 def process_customer_onboarding(spark):
     """
@@ -20,9 +21,9 @@ def process_customer_onboarding(spark):
     performs complex transformations, and writes to the dimensions table.
     """
     # 1. Read Raw Data sources (Simulated paths in HDFS)
-    raw_customers_df = spark.read.json("hdfs://namenode:8020/landing/fin/customers/")
-    raw_kyc_df = spark.read.parquet("hdfs://namenode:8020/landing/fin/kyc_status/")
-    raw_accounts_df = spark.read.csv("hdfs://namenode:8020/landing/fin/accounts/", header=True, inferSchema=True)
+    raw_customers_df = spark.read.json("gs://your-gcs-bucket/landing/fin/customers/") # HDFS path converted to Google Cloud Storage (GCS) path. Replace 'your-gcs-bucket' with your actual GCS bucket name.
+    raw_kyc_df = spark.read.parquet("gs://your-gcs-bucket/landing/fin/kyc_status/") # HDFS path converted to GCS path.
+    raw_accounts_df = spark.read.csv("gs://your-gcs-bucket/landing/fin/accounts/", header=True, inferSchema=True) # HDFS path converted to GCS path.
 
     # 2. Extract latest KYC status using Window Functions
     kyc_window = Window.partitionBy("customer_id").orderBy(col("verification_date").desc())
@@ -74,13 +75,13 @@ def process_customer_onboarding(spark):
         "onboarding_month", month(col("last_account_open_date"))
     )
 
-    # 6. Write to Managed Hive Table
-    # The target is fin_core.dim_customers partitioned by onboarding_year, onboarding_month, country_code
+    # 6. Write to Managed BigQuery Table
+    # The target is your_gcp_project_id.fin_core.dim_customers partitioned by onboarding_year, onboarding_month, country_code
     final_dim_customers.write \
         .partitionBy("onboarding_year", "onboarding_month", "country_code") \
-        .format("orc") \
+        .format("bigquery") \
         .mode("overwrite") \
-        .saveAsTable("fin_core.dim_customers")
+        .saveAsTable("your_gcp_project_id.fin_core.dim_customers") # Changed format from ORC (Hive specific) to 'bigquery' for direct write to BigQuery. Table name format changed from 'database.table' to 'project_id.dataset_id.table_id' for BigQuery. Replace 'your_gcp_project_id' with your Google Cloud Project ID. The `partitionBy` clause will result in a partitioned table in BigQuery.
 
     print(f"Successfully processed {final_dim_customers.count()} customer records.")
 
@@ -88,7 +89,11 @@ if __name__ == "__main__":
     spark = get_spark_session()
     
     # Optional: Setup DB for the demo 
-    spark.sql("CREATE DATABASE IF NOT EXISTS fin_core")
+    # Converted HiveQL 'CREATE DATABASE' to BigQuery 'CREATE SCHEMA'.
+    # Note that full Spark SQL DDL support for BigQuery (creating datasets/schemas) might require additional
+    # Spark catalog configurations specific to BigQuery or the dataset 'fin_core' could be pre-created
+    # using BigQuery UI, `bq` CLI, or Google Cloud client libraries.
+    spark.sql("CREATE SCHEMA IF NOT EXISTS fin_core OPTIONS(location='US')")
     
     process_customer_onboarding(spark)
     spark.stop()
