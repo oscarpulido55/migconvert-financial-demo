@@ -5,28 +5,27 @@
 -- day's balance snapshot.
 -- ==============================================================================
 
--- Ensure target database exists
-CREATE DATABASE IF NOT EXISTS fin_core;
+-- Ensure target dataset exists (BigQuery equivalent of Hive database)
+CREATE SCHEMA IF NOT EXISTS fin_core;
 
 -- 1. Create the Daily Balance Snapshot Table if it doesn't exist
 CREATE TABLE IF NOT EXISTS fin_core.fact_daily_balances (
-    account_id STRING COMMENT 'Unique identifier for the account',
-    customer_id STRING COMMENT 'Identifier for the account owner',
-    account_type STRING COMMENT 'Type of account (CHECKING, SAVINGS, LOAN)',
-    open_date DATE COMMENT 'Date the account was opened',
-    currency_code STRING COMMENT 'Base currency of the account',
-    beginning_balance DECIMAL(18, 4) COMMENT 'Balance at the start of the day',
-    total_credits DECIMAL(18, 4) COMMENT 'Total value of incoming funds',
-    total_debits DECIMAL(18, 4) COMMENT 'Total value of outgoing funds',
-    ending_balance DECIMAL(18, 4) COMMENT 'Balance at the end of the day',
-    interest_accrued DECIMAL(18, 4) COMMENT 'Daily interest accrued',
-    is_overdrawn BOOLEAN COMMENT 'Flag indicating if the account is in negative balance',
-    etl_timestamp TIMESTAMP
+    account_id STRING OPTIONS(description='Unique identifier for the account'),
+    customer_id STRING OPTIONS(description='Identifier for the account owner'),
+    account_type STRING OPTIONS(description='Type of account (CHECKING, SAVINGS, LOAN)'),
+    open_date DATE OPTIONS(description='Date the account was opened'),
+    currency_code STRING OPTIONS(description='Base currency of the account'),
+    beginning_balance NUMERIC(18, 4) OPTIONS(description='Balance at the start of the day'),
+    total_credits NUMERIC(18, 4) OPTIONS(description='Total value of incoming funds'),
+    total_debits NUMERIC(18, 4) OPTIONS(description='Total value of outgoing funds'),
+    ending_balance NUMERIC(18, 4) OPTIONS(description='Balance at the end of the day'),
+    interest_accrued NUMERIC(18, 4) OPTIONS(description='Daily interest accrued'),
+    is_overdrawn BOOLEAN OPTIONS(description='Flag indicating if the account is in negative balance'),
+    etl_timestamp TIMESTAMP OPTIONS(description='Timestamp of the ETL process')
 ) 
-COMMENT 'Stores the End of Day balances for all accounts'
-PARTITIONED BY (balance_date DATE, region_code STRING)
-STORED AS ORC
-TBLPROPERTIES ('transactional'='true');
+OPTIONS(description='Stores the End of Day balances for all accounts')
+PARTITION BY balance_date
+CLUSTER BY region_code;
 
 
 -- 2. Temporary table to hold today's net movements per account
@@ -59,7 +58,26 @@ FROM credited c
 FULL OUTER JOIN debited d ON c.account_id = d.account_id;
 
 -- 3. Calculate End of Day Balances and Insert Overwrite the partition
-INSERT OVERWRITE TABLE fin_core.fact_daily_balances PARTITION (balance_date, region_code)
+-- In BigQuery, to overwrite a specific partition, you typically DELETE existing data for that partition
+-- and then INSERT new data. BigQuery scripts support multi-statement queries.
+DELETE FROM fin_core.fact_daily_balances WHERE balance_date = '2024-01-01';
+
+INSERT INTO fin_core.fact_daily_balances (
+    account_id,
+    customer_id,
+    account_type,
+    open_date,
+    currency_code,
+    beginning_balance,
+    total_credits,
+    total_debits,
+    ending_balance,
+    interest_accrued,
+    is_overdrawn,
+    etl_timestamp,
+    balance_date,
+    region_code
+)
 SELECT 
     a.account_id,
     a.customer_id,
@@ -101,11 +119,12 @@ FROM fin_core.dim_accounts a
 -- Join with previous day's balance
 LEFT JOIN fin_core.fact_daily_balances prev 
     ON a.account_id = prev.account_id 
-    AND prev.balance_date = DATE_SUB(CAST('2024-01-01' AS DATE), 1)
+    AND prev.balance_date = DATE_SUB(CAST('2024-01-01' AS DATE), INTERVAL 1 DAY)
 -- Join with today's movements
 LEFT JOIN default.tmp_daily_movements_stg m 
     ON a.account_id = m.account_id
 WHERE a.status IN ('OPEN', 'FROZEN', 'DORMANT');
 
--- Clean up
+-- Clean up (temporary tables in BigQuery scripts are automatically dropped at script end)
+-- Explicit DROP is maintained for functional equivalence to original Hive script structure.
 DROP TABLE IF EXISTS default.tmp_daily_movements_stg;

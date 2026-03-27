@@ -1,6 +1,4 @@
-from pyspark.sql import SparkSession
-import pyspark.sql.functions as F
-from pyspark.sql.window import Window
+from google.cloud import bigquery
 import datetime
 import pytz
 import sys
@@ -20,187 +18,367 @@ class AlgorithmicTradingPerformance:
         )
         return local_datetime.astimezone(pytz.utc).strftime('%Y-%m-%d %H:%M:%S')
 
-    def execute_pipeline(self, spark: SparkSession, run_date: str):
+    def execute_pipeline(self, client: bigquery.Client, project_id: str, dataset_id: str, run_date: str):
         
-        # 1. Load Core Datasets
-        all_order_events_df = spark.read.parquet("hdfs://trading_events_base/")
-        parent_orders_df = spark.read.parquet("hdfs://parent_orders/")
-
-        # 2. Separate Event Stream into Fills
-        # Anonymized protocol filtering conceptually representing status flags
-        fills_df = all_order_events_df.filter(
-            ((F.col("protocol_version") == "V1") & (F.col("status").isin("FILLED", "PARTIAL")) & (F.col("event_type") == "TRADE"))
-            | ((F.col("protocol_version") >= "V2") & (F.col("event_type") == "FILL"))
-        )
-
-        # Get the closing fill price per order
-        close_fill_price_df = (fills_df
-            .withColumn("rn", F.row_number().over(Window.partitionBy("order_id", "client_id").orderBy("event_timestamp")))
-            .filter(F.col("rn") == 1)
-            .select(
-                F.col("order_id").alias("close_order_id"), 
-                F.col("client_id").alias("close_client_id"), 
-                F.col("last_exec_price").alias("closing_price"), 
-                F.col("last_exec_qty").alias("closing_qty")
-            )
-            .drop("rn"))
-
-        # Aggregate fills per order
-        fills_agg_df = (fills_df
-            .groupBy("order_id", "client_id", "trade_date")
-            .agg(
-                F.least(F.min("event_timestamp"), F.min("routing_timestamp")).alias("FillStartTime"),
-                F.min("event_timestamp").alias("FirstFillTime"),
-                F.sum("last_exec_qty").alias("TotalSharesExecuted"),
-                F.count("last_exec_qty").alias("NumberOfFills"),
-                (F.sum(F.col("last_exec_qty") * F.col("last_exec_price")) / F.sum("last_exec_qty")).alias("AverageExecutionPrice"),
-                F.sum(F.col("last_exec_qty") * F.col("last_exec_price")).alias("TotalMarketValueExecuted"),
-            ))
-            
-        # Prefix columns for joins
-        for col_name in fills_agg_df.columns:
-            if col_name not in ['order_id', 'client_id', 'trade_date']:
-                fills_agg_df = fills_agg_df.withColumnRenamed(col_name, "fill_" + col_name)
-
-        # 3. Execution Acknowledgements
-        acks_df = all_order_events_df.filter(F.col("status").isin("NEW", "REPLACED") & (F.col("event_type") == "ACK"))
-        acks_agg_df = (acks_df
-            .groupBy("order_id", "client_id", "trade_date")
-            .agg(F.least(F.min("event_timestamp"), F.min("routing_timestamp")).alias("AckStartTime")))
-            
-        for col_name in acks_agg_df.columns:
-            if col_name not in ['order_id', 'client_id', 'trade_date']:
-                acks_agg_df = acks_agg_df.withColumnRenamed(col_name, "ack_" + col_name)
-
-        # 4. Execution Terminations
-        terminations_df = all_order_events_df.filter(F.col("status").isin("CANCELED", "DONE_FOR_DAY", "EXPIRED", "REJECTED"))
-        terminations_agg_df = (terminations_df
-            .groupBy("order_id", "client_id", "trade_date")
-            .agg(F.greatest(F.max("event_timestamp"), F.max("routing_timestamp")).alias("ExecutionEndTime")))
-            
-        for col_name in terminations_agg_df.columns:
-            if col_name not in ['order_id', 'client_id', 'trade_date']:
-                terminations_agg_df = terminations_agg_df.withColumnRenamed(col_name, "term_" + col_name)
-
-        # 5. Bring it back to Parent Orders
-        enriched_orders_df = (
-            parent_orders_df.alias("p")
-            .join(fills_agg_df.alias("f"), (F.col("p.order_id") == F.col("f.order_id")) & (F.col("p.client_id") == F.col("f.client_id")), "left")
-            .join(acks_agg_df.alias("a"), (F.col("p.order_id") == F.col("a.order_id")) & (F.col("p.client_id") == F.col("a.client_id")), "left")
-            .join(terminations_agg_df.alias("t"), (F.col("p.order_id") == F.col("t.order_id")) & (F.col("p.client_id") == F.col("t.client_id")), "left")
-            .join(close_fill_price_df.alias("c"), (F.col("p.order_id") == F.col("c.close_order_id")) & (F.col("p.client_id") == F.col("c.close_client_id")), "left")
-        ).drop(F.col("f.order_id"), F.col("f.client_id"), F.col("a.order_id"), F.col("a.client_id"), F.col("t.order_id"), F.col("t.client_id"), F.col("c.close_order_id"), F.col("c.close_client_id"))
-
         utc_time_market_open = self.local_to_utc_time(9, 30, run_date)
         utc_time_market_close = self.local_to_utc_time(16, 00, run_date)
 
-        # Establish effective operating window
-        enriched_orders_df = (
-            enriched_orders_df
-            .withColumn("EffectiveStartTime", F.least(F.greatest(F.col("ack_AckStartTime"), F.lit(utc_time_market_open).cast("timestamp")), F.col("fill_FillStartTime")))
-            .withColumn("EffectiveEndTime", F.least(F.col("term_ExecutionEndTime"), F.lit(utc_time_market_close).cast("timestamp")))
-        )
-
-        # 6. Market Data Tick Metrics (complex time-based joins)
-        quotes_df = spark.read.parquet("hdfs://level1_quotes/")
-
-        quotes_df = quotes_df.repartition("ticker").sortWithinPartitions("quote_timestamp")
-        enriched_orders_df = enriched_orders_df.repartition("ticker").sortWithinPartitions("EffectiveStartTime")
-
-        quotes_df = quotes_df.withColumn("quote_pk", F.monotonically_increasing_id())
-        enriched_orders_df = enriched_orders_df.withColumn("order_pk", F.monotonically_increasing_id())
-
-        # Build Window buffers for Quote lookups
-        enriched_orders_df = (enriched_orders_df
-            .withColumn("Start_lower", F.expr(f"EffectiveStartTime - interval 10 minutes"))
-            .withColumn("End_lower", F.expr(f"EffectiveEndTime - interval 10 minutes"))
-            .withColumn("End_plus1", F.expr(f"EffectiveEndTime + interval 1 minutes"))
-            .withColumn("End_plus1_lower", F.expr(f"End_plus1 - interval 10 minutes"))
-            .withColumn("End_plus5", F.expr(f"EffectiveEndTime + interval 5 minutes"))
-            .withColumn("End_plus5_lower", F.expr(f"End_plus5 - interval 10 minutes"))
-        )
-
-        # Define a closure to reuse logic for looking up the nearest quote
-        def find_nearest_quote(orders_df, quotes_df, target_time_col, lower_bound_col, prefix):
-            join_cond = (orders_df["ticker"] == quotes_df["ticker"]) & (F.col("quote_timestamp").between(F.col(lower_bound_col), F.col(target_time_col)))
+        sql_query = f"""
+        WITH 
+        all_order_events_base AS (
+            SELECT * FROM `{project_id}.{dataset_id}.trading_events_base`
+        ),
+        parent_orders_base AS (
+            SELECT * FROM `{project_id}.{dataset_id}.parent_orders`
+        ),
+        
+        -- 2. Separate Event Stream into Fills
+        fills_df AS (
+            SELECT
+                *
+            FROM
+                all_order_events_base
+            WHERE
+                (
+                    (protocol_version = 'V1' AND status IN ('FILLED', 'PARTIAL') AND event_type = 'TRADE')
+                    OR
+                    (protocol_version >= 'V2' AND event_type = 'FILL')
+                )
+        ),
+        
+        -- Get the closing fill price per order
+        close_fill_price_df AS (
+            SELECT
+                order_id AS close_order_id, 
+                client_id AS close_client_id, 
+                last_exec_price AS closing_price, 
+                last_exec_qty AS closing_qty
+            FROM
+                (
+                    SELECT
+                        *,
+                        ROW_NUMBER() OVER (PARTITION BY order_id, client_id ORDER BY event_timestamp) AS rn
+                    FROM
+                        fills_df
+                )
+            WHERE rn = 1
+        ),
+        
+        -- Aggregate fills per order
+        fills_agg_df AS (
+            SELECT
+                order_id,
+                client_id,
+                trade_date,
+                LEAST(MIN(event_timestamp), MIN(routing_timestamp)) AS fill_FillStartTime,
+                MIN(event_timestamp) AS fill_FirstFillTime,
+                SUM(last_exec_qty) AS fill_TotalSharesExecuted,
+                COUNT(last_exec_qty) AS fill_NumberOfFills,
+                SUM(last_exec_qty * last_exec_price) / SUM(last_exec_qty) AS fill_AverageExecutionPrice,
+                SUM(last_exec_qty * last_exec_price) AS fill_TotalMarketValueExecuted
+            FROM
+                fills_df
+            GROUP BY
+                order_id,
+                client_id,
+                trade_date
+        ),
+        
+        -- 3. Execution Acknowledgements
+        acks_df AS (
+            SELECT *
+            FROM all_order_events_base
+            WHERE status IN ('NEW', 'REPLACED') AND event_type = 'ACK'
+        ),
+        acks_agg_df AS (
+            SELECT
+                order_id,
+                client_id,
+                trade_date,
+                LEAST(MIN(event_timestamp), MIN(routing_timestamp)) AS ack_AckStartTime
+            FROM
+                acks_df
+            GROUP BY
+                order_id,
+                client_id,
+                trade_date
+        ),
             
-            joined = (orders_df.join(quotes_df, join_cond, how="inner")
-                        .hint("merge")
-                        .withColumn("time_diff", F.abs(F.col(target_time_col) - F.col("quote_timestamp"))))
-                        
-            nearest = (joined
-                        .withColumn("rn", F.row_number().over(Window.partitionBy("order_pk").orderBy("time_diff")))
-                        .filter(F.col("rn") == 1)
-                        .drop("rn", "time_diff", "Start_lower", "End_lower", "End_plus1", "End_plus1_lower", "End_plus5", "End_plus5_lower", quotes_df["ticker"]))
-                        
-            # rename quote columns uniquely
-            for c in ["quote_timestamp", "best_bid", "best_ask"]:
-                nearest = nearest.withColumnRenamed(c, f"{prefix}_{c}")
-            return nearest
-
-        # Perform lookups
-        open_quotes = find_nearest_quote(enriched_orders_df, quotes_df, "EffectiveStartTime", "Start_lower", "start")
-        end_quotes = find_nearest_quote(enriched_orders_df, quotes_df, "EffectiveEndTime", "End_lower", "end")
-        end_1m_quotes = find_nearest_quote(enriched_orders_df, quotes_df, "End_plus1", "End_plus1_lower", "end_plus1")
+        -- 4. Execution Terminations
+        terminations_df AS (
+            SELECT *
+            FROM all_order_events_base
+            WHERE status IN ('CANCELED', 'DONE_FOR_DAY', 'EXPIRED', 'REJECTED')
+        ),
+        terminations_agg_df AS (
+            SELECT
+                order_id,
+                client_id,
+                trade_date,
+                GREATEST(MAX(event_timestamp), MAX(routing_timestamp)) AS term_ExecutionEndTime
+            FROM
+                terminations_df
+            GROUP BY
+                order_id,
+                client_id,
+                trade_date
+        ),
         
-        # 7. Core VWAP and Financial Performance calculations
-        trades_df = spark.read.parquet("hdfs://market_trades/")
+        -- 5. Bring it back to Parent Orders
+        enriched_orders_initial AS (
+            SELECT
+                p.*,
+                f.fill_FillStartTime,
+                f.fill_FirstFillTime,
+                f.fill_TotalSharesExecuted,
+                f.fill_NumberOfFills,
+                f.fill_AverageExecutionPrice,
+                f.fill_TotalMarketValueExecuted,
+                a.ack_AckStartTime,
+                t.term_ExecutionEndTime,
+                c.closing_price,
+                c.closing_qty
+            FROM
+                parent_orders_base AS p
+            LEFT JOIN
+                fills_agg_df AS f ON p.order_id = f.order_id AND p.client_id = f.client_id
+            LEFT JOIN
+                acks_agg_df AS a ON p.order_id = a.order_id AND p.client_id = a.client_id
+            LEFT JOIN
+                terminations_agg_df AS t ON p.order_id = t.order_id AND p.client_id = t.client_id
+            LEFT JOIN
+                close_fill_price_df AS c ON p.order_id = c.close_order_id AND p.client_id = c.close_client_id
+        ),
         
-        # VWAP during order existence
-        vwap_df = (enriched_orders_df
-            .join(trades_df, (enriched_orders_df["ticker"] == trades_df["ticker"]) &
-                             (trades_df["trade_timestamp"] >= enriched_orders_df["EffectiveStartTime"]) &
-                             (trades_df["trade_timestamp"] <= enriched_orders_df["EffectiveEndTime"]), "inner")
-            .groupBy("order_id", "client_id")
-            .agg(
-                F.sum(trades_df["trade_size"]).alias("market_interval_volume"),
-                (F.sum(trades_df["trade_price"] * trades_df["trade_size"]) / F.sum(trades_df["trade_size"])).alias("market_interval_vwap")
-            ))
+        -- Establish effective operating window
+        enriched_orders_with_effective_times AS (
+            SELECT
+                *,
+                LEAST(
+                    GREATEST(ack_AckStartTime, CAST('{utc_time_market_open}' AS TIMESTAMP)),
+                    fill_FillStartTime
+                ) AS EffectiveStartTime,
+                LEAST(
+                    term_ExecutionEndTime,
+                    CAST('{utc_time_market_close}' AS TIMESTAMP)
+                ) AS EffectiveEndTime
+            FROM
+                enriched_orders_initial
+        ),
 
-        # Join everything back
-        final_df = (enriched_orders_df
-            .join(vwap_df, ["order_id", "client_id"], "left")
-            # Selectively bringing fields from quote buffers
-            .join(open_quotes.select("order_pk", "start_best_bid", "start_best_ask", "start_quote_timestamp"), "order_pk", "left")
-            .join(end_quotes.select("order_pk", "end_best_bid", "end_best_ask"), "order_pk", "left")
-            .join(end_1m_quotes.select("order_pk", "end_plus1_best_bid", "end_plus1_best_ask"), "order_pk", "left")
-        )
+        -- 6. Market Data Tick Metrics (complex time-based joins)
+        quotes_base AS (
+            SELECT *, GENERATE_UUID() AS quote_pk_raw FROM `{project_id}.{dataset_id}.level1_quotes` -- Added _raw suffix to avoid column name clash
+        ),
+        trades_base AS (
+            SELECT * FROM `{project_id}.{dataset_id}.market_trades`
+        ),
 
-        # Calculate complex performance metrics (Slippage, Momentum, Profit/Loss vectors)
-        final_df = final_df.withColumn("arrival_mid_price", (F.col("start_best_bid") + F.col("start_best_ask")) / 2)
+        -- Add unique identifiers to orders and compute time buffers for joins
+        enriched_orders_processed AS (
+            SELECT
+                *,
+                GENERATE_UUID() AS order_pk, -- Replaced F.monotonically_increasing_id()
+                TIMESTAMP_SUB(EffectiveStartTime, INTERVAL 10 MINUTE) AS Start_lower,
+                TIMESTAMP_SUB(EffectiveEndTime, INTERVAL 10 MINUTE) AS End_lower,
+                TIMESTAMP_ADD(EffectiveEndTime, INTERVAL 1 MINUTE) AS End_plus1,
+                TIMESTAMP_SUB(TIMESTAMP_ADD(EffectiveEndTime, INTERVAL 1 MINUTE), INTERVAL 10 MINUTE) AS End_plus1_lower,
+                TIMESTAMP_ADD(EffectiveEndTime, INTERVAL 5 MINUTE) AS End_plus5,
+                TIMESTAMP_SUB(TIMESTAMP_ADD(EffectiveEndTime, INTERVAL 5 MINUTE), INTERVAL 10 MINUTE) AS End_plus5_lower
+            FROM
+                enriched_orders_with_effective_times
+        ),
+
+        -- open_quotes
+        open_quotes_candidate AS (
+            SELECT
+                e.order_pk,
+                q.quote_timestamp,
+                q.best_bid,
+                q.best_ask,
+                ABS(TIMESTAMP_DIFF(e.EffectiveStartTime, q.quote_timestamp, MICROSECOND)) AS time_diff_microseconds
+            FROM
+                enriched_orders_processed AS e
+            INNER JOIN
+                quotes_base AS q
+            ON
+                e.ticker = q.ticker AND q.quote_timestamp BETWEEN e.Start_lower AND e.EffectiveStartTime
+        ),
+        open_quotes AS (
+            SELECT
+                order_pk,
+                quote_timestamp AS start_quote_timestamp,
+                best_bid AS start_best_bid,
+                best_ask AS start_best_ask
+            FROM
+                (
+                    SELECT
+                        *,
+                        ROW_NUMBER() OVER (PARTITION BY order_pk ORDER BY time_diff_microseconds) AS rn
+                    FROM
+                        open_quotes_candidate
+                )
+            WHERE rn = 1
+        ),
         
-        # Slippage from VWAP
-        final_df = final_df.withColumn("slippage_from_vwap_bps",
-            F.when(F.col("side") == "BUY", ((F.col("fill_AverageExecutionPrice") - F.col("market_interval_vwap")) / F.col("market_interval_vwap")) * 10000)
-             .when(F.col("side") == "SELL", ((F.col("market_interval_vwap") - F.col("fill_AverageExecutionPrice")) / F.col("market_interval_vwap")) * 10000)
-        )
-
-        # Slippage from Arrival Mid (Implementation Shortfall)
-        final_df = final_df.withColumn("implementation_shortfall_pl",
-            F.when(F.col("side") == "BUY", (F.col("arrival_mid_price") - F.col("fill_AverageExecutionPrice")) * F.col("fill_TotalSharesExecuted"))
-             .when(F.col("side") == "SELL", (F.col("fill_AverageExecutionPrice") - F.col("arrival_mid_price")) * F.col("fill_TotalSharesExecuted"))
-        )
+        -- end_quotes
+        end_quotes_candidate AS (
+            SELECT
+                e.order_pk,
+                q.quote_timestamp,
+                q.best_bid,
+                q.best_ask,
+                ABS(TIMESTAMP_DIFF(e.EffectiveEndTime, q.quote_timestamp, MICROSECOND)) AS time_diff_microseconds
+            FROM
+                enriched_orders_processed AS e
+            INNER JOIN
+                quotes_base AS q
+            ON
+                e.ticker = q.ticker AND q.quote_timestamp BETWEEN e.End_lower AND e.EffectiveEndTime
+        ),
+        end_quotes AS (
+            SELECT
+                order_pk,
+                quote_timestamp AS end_quote_timestamp,
+                best_bid AS end_best_bid,
+                best_ask AS end_best_ask
+            FROM
+                (
+                    SELECT
+                        *,
+                        ROW_NUMBER() OVER (PARTITION BY order_pk ORDER BY time_diff_microseconds) AS rn
+                    FROM
+                        end_quotes_candidate
+                )
+            WHERE rn = 1
+        ),
         
-        # Momentum calculations post-trade
-        final_df = final_df.withColumn("post_trade_1m_momentum",
-            F.when(F.col("side") == "BUY", (((F.col("end_plus1_best_bid") + F.col("end_plus1_best_ask")) / 2) - ((F.col("end_best_bid") + F.col("end_best_ask")) / 2)) * F.col("fill_TotalSharesExecuted"))
-             .when(F.col("side") == "SELL", (((F.col("end_best_bid") + F.col("end_best_ask")) / 2) - ((F.col("end_plus1_best_bid") + F.col("end_plus1_best_ask")) / 2)) * F.col("fill_TotalSharesExecuted"))
+        -- end_1m_quotes
+        end_1m_quotes_candidate AS (
+            SELECT
+                e.order_pk,
+                q.quote_timestamp,
+                q.best_bid,
+                q.best_ask,
+                ABS(TIMESTAMP_DIFF(e.End_plus1, q.quote_timestamp, MICROSECOND)) AS time_diff_microseconds
+            FROM
+                enriched_orders_processed AS e
+            INNER JOIN
+                quotes_base AS q
+            ON
+                e.ticker = q.ticker AND q.quote_timestamp BETWEEN e.End_plus1_lower AND e.End_plus1
+        ),
+        end_1m_quotes AS (
+            SELECT
+                order_pk,
+                quote_timestamp AS end_plus1_quote_timestamp,
+                best_bid AS end_plus1_best_bid,
+                best_ask AS end_plus1_best_ask
+            FROM
+                (
+                    SELECT
+                        *,
+                        ROW_NUMBER() OVER (PARTITION BY order_pk ORDER BY time_diff_microseconds) AS rn
+                    FROM
+                        end_1m_quotes_candidate
+                )
+            WHERE rn = 1
+        ),
+
+        -- 7. Core VWAP and Financial Performance calculations
+        vwap_df AS (
+            SELECT
+                e.order_id,
+                e.client_id,
+                SUM(t.trade_size) AS market_interval_volume,
+                SUM(t.trade_price * t.trade_size) / SUM(t.trade_size) AS market_interval_vwap
+            FROM
+                enriched_orders_processed AS e
+            INNER JOIN
+                trades_base AS t
+            ON
+                e.ticker = t.ticker AND t.trade_timestamp >= e.EffectiveStartTime AND t.trade_timestamp <= e.EffectiveEndTime
+            GROUP BY
+                e.order_id,
+                e.client_id
+        ),
+        
+        -- Join everything back for final calculations
+        final_df_base AS (
+            SELECT
+                e.* EXCEPT (Start_lower, End_lower, End_plus1, End_plus1_lower, End_plus5, End_plus5_lower),
+                v.market_interval_volume,
+                v.market_interval_vwap,
+                oq.start_best_bid,
+                oq.start_best_ask,
+                oq.start_quote_timestamp,
+                eq.end_best_bid,
+                eq.end_best_ask,
+                e1m.end_plus1_best_bid,
+                e1m.end_plus1_best_ask
+            FROM
+                enriched_orders_processed AS e
+            LEFT JOIN
+                vwap_df AS v ON e.order_id = v.order_id AND e.client_id = v.client_id
+            LEFT JOIN
+                open_quotes AS oq ON e.order_pk = oq.order_pk
+            LEFT JOIN
+                end_quotes AS eq ON e.order_pk = eq.order_pk
+            LEFT JOIN
+                end_1m_quotes AS e1m ON e.order_pk = e1m.order_pk
+        )
+        SELECT
+            *,
+            (start_best_bid + start_best_ask) / 2 AS arrival_mid_price,
+            
+            CASE
+                WHEN side = 'BUY' THEN ((fill_AverageExecutionPrice - market_interval_vwap) / market_interval_vwap) * 10000
+                WHEN side = 'SELL' THEN ((market_interval_vwap - fill_AverageExecutionPrice) / market_interval_vwap) * 10000
+                ELSE NULL
+            END AS slippage_from_vwap_bps,
+
+            CASE
+                WHEN side = 'BUY' THEN ( (start_best_bid + start_best_ask) / 2 - fill_AverageExecutionPrice ) * fill_TotalSharesExecuted
+                WHEN side = 'SELL' THEN ( fill_AverageExecutionPrice - (start_best_bid + start_best_ask) / 2 ) * fill_TotalSharesExecuted
+                ELSE NULL
+            END AS implementation_shortfall_pl,
+            
+            CASE
+                WHEN side = 'BUY' THEN ( ((end_plus1_best_bid + end_plus1_best_ask) / 2) - ((end_best_bid + end_best_ask) / 2) ) * fill_TotalSharesExecuted
+                WHEN side = 'SELL' THEN ( ((end_best_bid + end_best_ask) / 2) - ((end_plus1_best_bid + end_plus1_best_ask) / 2) ) * fill_TotalSharesExecuted
+                ELSE NULL
+            END AS post_trade_1m_momentum,
+
+            CASE
+                WHEN side = 'BUY' THEN (requested_shares - fill_TotalSharesExecuted) * (fill_AverageExecutionPrice - closing_price)
+                WHEN side = 'SELL' THEN (requested_shares - fill_TotalSharesExecuted) * (closing_price - fill_AverageExecutionPrice)
+                ELSE NULL
+            END AS opportunity_cost_pl
+
+        FROM
+            final_df_base
+        """
+        
+        destination_table_id_with_date = f"{project_id}.{dataset_id}.trading_analytics_{run_date.replace('-', '_')}"
+
+        job_config = bigquery.QueryJobConfig(
+            destination=destination_table_id_with_date,
+            write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
         )
 
-        final_df = final_df.withColumn("opportunity_cost_pl",
-            F.when(F.col("side") == "BUY", (F.col("requested_shares") - F.col("fill_TotalSharesExecuted")) * (F.col("fill_AverageExecutionPrice") - F.col("closing_price")))
-             .when(F.col("side") == "SELL", (F.col("requested_shares") - F.col("fill_TotalSharesExecuted")) * (F.col("closing_price") - F.col("fill_AverageExecutionPrice")))
-        )
-
-        final_df.write.parquet(f"hdfs://trading_analytics/run_date={run_date}", mode="overwrite")
-        print("Performance analysis complete.")
+        query_job = client.query(sql_query, job_config=job_config)
+        query_job.result()
+        print("Performance analysis complete and data written to BigQuery table: " + destination_table_id_with_date)
 
 if __name__ == "__main__":
-    import sys
-    if len(sys.argv) < 2:
+    if len(sys.argv) < 4:
+        print("Usage: python script_name.py <run_date> <project_id> <dataset_id>")
         sys.exit(1)
     
-    spark = SparkSession.builder.appName("AlgorithmicTradingPerformance").getOrCreate()
+    client = bigquery.Client()
+    
     p = AlgorithmicTradingPerformance()
-    p.execute_pipeline(spark, sys.argv[1])
-    spark.stop()
+    run_date = sys.argv[1]
+    project_id = sys.argv[2]
+    dataset_id = sys.argv[3]
+    p.execute_pipeline(client, project_id, dataset_id, run_date)
