@@ -21,10 +21,17 @@ class AlgorithmicTradingPerformance:
         return local_datetime.astimezone(pytz.utc).strftime('%Y-%m-%d %H:%M:%S')
 
     def execute_pipeline(self, spark: SparkSession, run_date: str):
+        # Required configuration: Replace with your actual Google Cloud Project ID and BigQuery Dataset ID.
+        # Required configuration: Replace with a Google Cloud Storage (GCS) bucket for temporary Spark BigQuery connector files.
+        bigquery_project_id = "your_project_id" # Placeholder for BigQuery project ID
+        bigquery_dataset_id = "your_dataset_id" # Placeholder for BigQuery dataset ID
+        gcs_temp_bucket = "your_gcs_temp_bucket" # Placeholder for a GCS bucket
         
         # 1. Load Core Datasets
-        all_order_events_df = spark.read.parquet("hdfs://trading_events_base/")
-        parent_orders_df = spark.read.parquet("hdfs://parent_orders/")
+        # Changed: Reading from BigQuery table instead of HDFS Parquet.
+        all_order_events_df = spark.read.format("bigquery").option("table", f"{bigquery_project_id}.{bigquery_dataset_id}.trading_events_base").load()
+        # Changed: Reading from BigQuery table instead of HDFS Parquet.
+        parent_orders_df = spark.read.format("bigquery").option("table", f"{bigquery_project_id}.{bigquery_dataset_id}.parent_orders").load()
 
         # 2. Separate Event Stream into Fills
         # Anonymized protocol filtering conceptually representing status flags
@@ -102,10 +109,11 @@ class AlgorithmicTradingPerformance:
         )
 
         # 6. Market Data Tick Metrics (complex time-based joins)
-        quotes_df = spark.read.parquet("hdfs://level1_quotes/")
+        # Changed: Reading from BigQuery table instead of HDFS Parquet.
+        quotes_df = spark.read.format("bigquery").option("table", f"{bigquery_project_id}.{bigquery_dataset_id}.level1_quotes").load()
 
-        quotes_df = quotes_df.repartition("ticker").sortWithinPartitions("quote_timestamp")
-        enriched_orders_df = enriched_orders_df.repartition("ticker").sortWithinPartitions("EffectiveStartTime")
+        # Removed: Spark-specific repartitioning and sorting. BigQuery handles data distribution and query optimization differently.
+        # Removed: Spark-specific repartitioning and sorting. BigQuery handles data distribution and query optimization differently.
 
         quotes_df = quotes_df.withColumn("quote_pk", F.monotonically_increasing_id())
         enriched_orders_df = enriched_orders_df.withColumn("order_pk", F.monotonically_increasing_id())
@@ -125,7 +133,7 @@ class AlgorithmicTradingPerformance:
             join_cond = (orders_df["ticker"] == quotes_df["ticker"]) & (F.col("quote_timestamp").between(F.col(lower_bound_col), F.col(target_time_col)))
             
             joined = (orders_df.join(quotes_df, join_cond, how="inner")
-                        .hint("merge")
+                        # Removed: Spark-specific join hint. BigQuery's optimizer manages join strategies automatically.
                         .withColumn("time_diff", F.abs(F.col(target_time_col) - F.col("quote_timestamp"))))
                         
             nearest = (joined
@@ -144,7 +152,8 @@ class AlgorithmicTradingPerformance:
         end_1m_quotes = find_nearest_quote(enriched_orders_df, quotes_df, "End_plus1", "End_plus1_lower", "end_plus1")
         
         # 7. Core VWAP and Financial Performance calculations
-        trades_df = spark.read.parquet("hdfs://market_trades/")
+        # Changed: Reading from BigQuery table instead of HDFS Parquet.
+        trades_df = spark.read.format("bigquery").option("table", f"{bigquery_project_id}.{bigquery_dataset_id}.market_trades").load()
         
         # VWAP during order existence
         vwap_df = (enriched_orders_df
@@ -192,7 +201,14 @@ class AlgorithmicTradingPerformance:
              .when(F.col("side") == "SELL", (F.col("requested_shares") - F.col("fill_TotalSharesExecuted")) * (F.col("closing_price") - F.col("fill_AverageExecutionPrice")))
         )
 
-        final_df.write.parquet(f"hdfs://trading_analytics/run_date={run_date}", mode="overwrite")
+        # Changed: Writing to BigQuery table instead of HDFS Parquet.
+        # Uses 'run_date' to dynamically name the output BigQuery table, overwriting if it exists.
+        # Required configuration: 'temporaryGcsBucket' option needs a GCS bucket for intermediate data by Spark-BigQuery connector.
+        final_df.write.format("bigquery") \
+            .option("table", f"{bigquery_project_id}.{bigquery_dataset_id}.trading_analytics_{run_date.replace('-', '')}") \
+            .option("temporaryGcsBucket", gcs_temp_bucket) \
+            .mode("overwrite") \
+            .save()
         print("Performance analysis complete.")
 
 if __name__ == "__main__":
@@ -200,7 +216,13 @@ if __name__ == "__main__":
     if len(sys.argv) < 2:
         sys.exit(1)
     
-    spark = SparkSession.builder.appName("AlgorithmicTradingPerformance").getOrCreate()
+    # Changed: Added BigQuery connector package configuration for SparkSession.
+    # Required configuration: Ensure 'spark-bigquery-with-dependencies' JAR is available (e.g., via --packages or spark.jars.packages).
+    # This example uses version 0.29.0, compatible with Scala 2.12. Adjust version if needed.
+    spark = SparkSession.builder \
+        .appName("AlgorithmicTradingPerformance") \
+        .config("spark.jars.packages", "com.google.cloud.spark:spark-bigquery-with-dependencies_2.12:0.29.0") \
+        .getOrCreate()
     p = AlgorithmicTradingPerformance()
     p.execute_pipeline(spark, sys.argv[1])
     spark.stop()

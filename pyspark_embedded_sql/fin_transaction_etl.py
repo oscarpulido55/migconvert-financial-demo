@@ -7,29 +7,36 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 def create_spark_session():
-    """Initializes Spark Session with Hive Metastore connection and strict dynamic partitioning."""
+    """Initializes Spark Session with BigQuery connector and settings."""
+    # Removed Hive-specific configurations like 'enableHiveSupport' and 'hive.exec.dynamic.partition'.
+    # Added BigQuery connector properties:
+    # 'spark.jars.packages' specifies the Spark-BigQuery connector dependency.
+    # 'parentProject' and 'temporaryGcsBucket' are typically required for BigQuery writes from Spark.
+    # 'spark.cloud.google.credentials.file' (or GOOGLE_APPLICATION_CREDENTIALS env var) and
+    # 'spark.hadoop.google.cloud.auth.service.account.enable' configure service account authentication.
     return SparkSession.builder \
-        .appName("Financial_Transaction_ETL_Embedded_SQL") \
-        .enableHiveSupport() \
-        .config("hive.exec.dynamic.partition", "true") \
-        .config("hive.exec.dynamic.partition.mode", "nonstrict") \
-        .config("hive.exec.max.dynamic.partitions", "2000") \
-        .config("hive.exec.max.dynamic.partitions.pernode", "256") \
+        .appName("Financial_Transaction_ETL_BigQuery_Embedded_SQL") \
+        .config("spark.jars.packages", "com.google.cloud.spark:spark-bigquery-with-dependencies_2.12:0.29.0") \
+        .config("parentProject", "your-gcp-project-id") \
+        .config("temporaryGcsBucket", "your-gcs-bucket-for-temp-data") \
+        .config("spark.cloud.google.credentials.file", "/path/to/your/service-account-key.json") \
+        .config("spark.hadoop.google.cloud.auth.service.account.enable", "true") \
         .getOrCreate()
 
 def run_etl_pipeline(spark: SparkSession, process_date: str):
     """
-    Executes the ETL pipeline using complex embedded Hive SQL queries.
+    Executes the ETL pipeline using complex embedded BigQuery SQL queries via Spark.
     This demonstrates the capability of managing SQL directly within Python strings.
     """
     logger.info(f"Starting execution for process_date: {process_date}")
 
-    # Set parameters for the session
-    spark.sql(f"SET hiveconf:process_date='{process_date}'")
+    # The HiveQL 'SET hiveconf:process_date='{process_date}' is not directly applicable to BigQuery.
+    # The process_date variable is now directly embedded into SQL strings using Python f-strings,
+    # ensuring it's treated as a BigQuery DATE type.
 
     # 1. Create temporary view for the delta transactions from daily landing zone
     logger.info("Creating temporary view for raw transactions...")
-    spark.sql("""
+    spark.sql(f"""
         CREATE OR REPLACE TEMPORARY VIEW raw_trx_delta AS
         SELECT
             trx_uuid,
@@ -45,13 +52,22 @@ def run_etl_pipeline(spark: SparkSession, process_date: str):
             status,
             error_code
         FROM fin_landing.raw_transactions
-        WHERE to_date(transaction_timestamp) = '${hiveconf:process_date}'
+        WHERE DATE(transaction_timestamp) = DATE '{process_date}' -- Converted from HIVEQL's to_date() and '${hiveconf:process_date}' variable syntax
     """)
 
     # 2. Complex ETL to fact table using embedded SQL
     logger.info("Inserting data into fin_core.fact_transactions...")
-    insert_sql = """
-        INSERT OVERWRITE TABLE fin_core.fact_transactions PARTITION (trx_date, region_id)
+    # To achieve functional equivalence of Hive's 'INSERT OVERWRITE PARTITION (col)',
+    # BigQuery for partitioned tables (e.g., partitioned by 'trx_date') typically requires
+    # an explicit DELETE of existing data for the target partition, followed by an INSERT INTO for the new data.
+    delete_fact_sql = f"""
+        DELETE FROM fin_core.fact_transactions
+        WHERE trx_date = DATE '{process_date}'
+    """
+    spark.sql(delete_fact_sql)
+
+    insert_sql = f"""
+        INSERT INTO fin_core.fact_transactions -- Converted from HIVEQL's 'INSERT OVERWRITE TABLE ... PARTITION (...)'
         SELECT
             r.trx_uuid,
             r.source_account_id,
@@ -75,21 +91,29 @@ def run_etl_pipeline(spark: SparkSession, process_date: str):
             ) AS rolling_10_trx_amount,
             r.status,
             
-            -- Partitioning Columns
-            to_date(r.transaction_timestamp) AS trx_date,
+            -- Partitioning Columns (BigQuery expects the partitioning column, e.g., 'trx_date', to be part of the SELECT list)
+            DATE(r.transaction_timestamp) AS trx_date, -- Converted from HIVEQL's to_date()
             COALESCE(dim_a.region_id, 'UNKNOWN') AS region_id
         FROM raw_trx_delta r
         LEFT JOIN fin_core.dim_accounts dim_a ON r.source_account_id = dim_a.account_id
         LEFT JOIN fin_core.dim_customers c ON dim_a.customer_id = c.customer_id
         WHERE r.status IN ('COMPLETED', 'SETTLED', 'PENDING_CLEARANCE')
           AND r.transaction_type != 'INTERNAL_TRANSFER_REVERSAL'
+          AND DATE(r.transaction_timestamp) = DATE '{process_date}' -- Ensures only relevant data for process_date is inserted, consistent with partition overwrite
     """
     spark.sql(insert_sql)
 
     # 3. Create Aggregated Datamart for Risk Analysis
     logger.info("Executing aggregation for Risk Datamart...")
-    risk_sql = """
-        INSERT OVERWRITE TABLE fin_mart.risk_daily_summary PARTITION (summary_date)
+    # Similar to the fact table, using DELETE and INSERT to emulate 'INSERT OVERWRITE PARTITION' for the 'summary_date' partition.
+    delete_risk_sql = f"""
+        DELETE FROM fin_mart.risk_daily_summary
+        WHERE summary_date = DATE '{process_date}'
+    """
+    spark.sql(delete_risk_sql)
+
+    risk_sql = f"""
+        INSERT INTO fin_mart.risk_daily_summary -- Converted from HIVEQL's 'INSERT OVERWRITE TABLE ... PARTITION (...)'
         SELECT
             customer_id,
             customer_segment,
@@ -105,9 +129,9 @@ def run_etl_pipeline(spark: SparkSession, process_date: str):
                 WHEN COUNT(trx_uuid) > 100 THEN 'MEDIUM'
                 ELSE 'LOW' 
             END AS daily_risk_flag,
-            '${hiveconf:process_date}' AS summary_date
+            DATE '{process_date}' AS summary_date -- Converted from HIVEQL's '${hiveconf:process_date}' variable
         FROM fin_core.fact_transactions
-        WHERE trx_date = '${hiveconf:process_date}'
+        WHERE trx_date = DATE '{process_date}' -- Converted from HIVEQL's '${hiveconf:process_date}' variable
         GROUP BY 
             customer_id,
             customer_segment,
@@ -125,10 +149,11 @@ if __name__ == "__main__":
     p_date = sys.argv[1]
     sp = create_spark_session()
     
-    # Initialize DBs for safety
-    sp.sql("CREATE DATABASE IF NOT EXISTS fin_landing")
-    sp.sql("CREATE DATABASE IF NOT EXISTS fin_core")
-    sp.sql("CREATE DATABASE IF NOT EXISTS fin_mart")
+    # In BigQuery, databases are referred to as 'datasets' or 'schemas'.
+    # This command creates BigQuery datasets if they don't exist.
+    sp.sql("CREATE SCHEMA IF NOT EXISTS fin_landing") # Converted from HIVEQL's CREATE DATABASE
+    sp.sql("CREATE SCHEMA IF NOT EXISTS fin_core")    # Converted from HIVEQL's CREATE DATABASE
+    sp.sql("CREATE SCHEMA IF NOT EXISTS fin_mart")     # Converted from HIVEQL's CREATE DATABASE
     
     run_etl_pipeline(sp, p_date)
     sp.stop()
