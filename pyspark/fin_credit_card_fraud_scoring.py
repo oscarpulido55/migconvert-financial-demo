@@ -7,9 +7,14 @@ from pyspark.sql.window import Window
 
 def create_spark_session():
     """Initializes and returns a Spark session with Hive Metastore support."""
+    # For BigQuery, we typically use the Spark BigQuery Connector.
+    # The 'enableHiveSupport()' is specific to Hive Metastore integration,
+    # which is not directly applicable when reading/writing to BigQuery.
+    # Instead, we will configure the Spark session to use the BigQuery connector
+    # and reference datasets/tables using BigQuery's project.dataset.table syntax.
     return SparkSession.builder \
         .appName("Financial_Credit_Card_Fraud_Scoring") \
-        .enableHiveSupport() \
+        .config("spark.jars.packages", "com.google.cloud.spark:spark-bigquery-with-dependencies_2.12:0.29.0") \
         .getOrCreate()
 
 # Create a custom UDF for great circle distance
@@ -31,11 +36,24 @@ def score_transactions_for_fraud(spark, execution_date):
     Uses pure PySpark DataFrame APIs to score credit card transactions.
     Replaces embedded SQL with continuous DataFrame transformations.
     """
+    # Define BigQuery project and dataset for source and target tables
+    # These should ideally be passed as parameters or configured externally
+    bigquery_project = "your-gcp-project-id" # Replace with your GCP Project ID
+    bigquery_source_dataset = "fin_core" # BigQuery dataset where source tables reside
+    bigquery_target_dataset = "fin_mart" # BigQuery dataset for target table
+
+    # Function to read BigQuery table
+    def read_bigquery_table(table_name):
+        return spark.read.format("bigquery") \
+            .option("project", bigquery_project) \
+            .option("dataset", bigquery_source_dataset) \
+            .option("table", table_name) \
+            .load()
     
-    # 1. Load Data
-    full_cc_trx = spark.table("fin_core.cc_transactions")
-    accounts = spark.table("fin_core.dim_accounts")
-    merchants = spark.table("fin_core.dim_merchants")
+    # 1. Load Data - Updated to read from BigQuery using `spark.read.format("bigquery")`
+    full_cc_trx = read_bigquery_table("cc_transactions")
+    accounts = read_bigquery_table("dim_accounts")
+    merchants = read_bigquery_table("dim_merchants")
     
     # 2. Extract current day transactions
     cc_trx = full_cc_trx.filter(col("trx_date") == execution_date)
@@ -103,11 +121,18 @@ def score_transactions_for_fraud(spark, execution_date):
         "fraud_score", "is_fraud_alert", lit(execution_date).alias("scoring_date")
     )
     
+    # Write to BigQuery using `spark.write.format("bigquery")`
+    # HiveQL's `insertInto` behavior with "append" mode can be replicated by setting "writeMethod"
+    # and specifying the target table. BigQuery table name format: `project.dataset.table`
     final_output.write \
+        .format("bigquery") \
+        .option("project", bigquery_project) \
+        .option("dataset", bigquery_target_dataset) \
+        .option("table", "fraud_scores_daily") \
         .mode("append") \
-        .insertInto("fin_mart.fraud_scores_daily")
+        .save()
     
-    print(f"Pure DataFrame Fraud scoring completed for {execution_date}")
+    print(f"Pure DataFrame Fraud scoring completed for {execution_date} and written to BigQuery.")
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:

@@ -18,12 +18,15 @@ CREATE TABLE IF NOT EXISTS fin_core.dim_customers_scd2 (
     effective_start_date TIMESTAMP,
     effective_end_date TIMESTAMP,
     is_active BOOLEAN
-) STORED AS ORC;
+);
+-- Comment: Removed 'STORED AS ORC' as BigQuery manages storage format internally.
 
 -- View logic to do an SCD 2 transform over yesterday's active snapshot vs today's delta update
 DROP VIEW IF EXISTS default.vw_scd_transform_stg;
+-- Comment: Assumes 'default' is a valid BigQuery dataset name.
 
 CREATE VIEW default.vw_scd_transform_stg AS
+-- Comment: Assumes 'default' is a valid BigQuery dataset name.
 WITH active_records AS (
     SELECT * 
     FROM fin_core.dim_customers_scd2 
@@ -43,7 +46,8 @@ incoming_updates AS (
     FROM (
         SELECT *, ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY timestamp DESC) as rn
         FROM fin_landing.customer_updates
-        WHERE to_date(timestamp) = '2024-01-01'
+        WHERE DATE(timestamp) = '2024-01-01'
+        -- Comment: Replaced Hive's to_date() with BigQuery's DATE() function.
     ) t WHERE rn = 1
 )
 
@@ -86,7 +90,8 @@ FROM incoming_updates i
 FULL OUTER JOIN active_records a ON i.customer_id = a.customer_id;
 
 -- 1. Insert the retired rows (closing the effective_end_date and setting is_active = false)
-INSERT INTO TABLE fin_core.dim_customers_scd2
+INSERT INTO fin_core.dim_customers_scd2
+-- Comment: Removed 'TABLE' keyword, which is optional in BigQuery INSERT statements.
 SELECT 
     old_sk,
     customer_id,
@@ -103,10 +108,12 @@ FROM default.vw_scd_transform_stg
 WHERE change_type = 'UPDATE';
 
 -- 2. Insert the completely NEW rows, and the NEW ACTIVE instances of updated rows
-INSERT INTO TABLE fin_core.dim_customers_scd2
+INSERT INTO fin_core.dim_customers_scd2
+-- Comment: Removed 'TABLE' keyword, which is optional in BigQuery INSERT statements.
 SELECT 
     -- Generate new Surrogate Key (UUID)
-    reflect("java.util.UUID", "randomUUID") AS customer_surrogate_key,
+    GENERATE_UUID() AS customer_surrogate_key,
+    -- Comment: Replaced Hive reflect() UDF for UUID generation with BigQuery's GENERATE_UUID() function.
     customer_id,
     first_name_new,
     last_name_new,
@@ -124,3 +131,4 @@ WHERE change_type IN ('INSERT', 'UPDATE');
 -- If maintaining an OVERWRITE pipeline, we'd also insert back the 'NO CHANGE' rows exactly as they were.
 
 DROP VIEW IF EXISTS default.vw_scd_transform_stg;
+-- Comment: Assumes 'default' is a valid BigQuery dataset name.
