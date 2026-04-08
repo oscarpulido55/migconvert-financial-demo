@@ -1,7 +1,7 @@
 -- ==============================================================================
--- Module: fin_customer_mdm_merge.hql
+-- Module: fin_customer_mdm_merge.sql
 -- Description: Master Data Management (MDM) module performing a Slowly Changing 
--- Dimension (SCD) Type 2 upsert operation purely through Hive SQL using FULL OUTER 
+-- Dimension (SCD) Type 2 upsert operation purely through BigQuery SQL using FULL OUTER 
 -- JOIN and complex CASE evaluations.
 -- ==============================================================================
 
@@ -17,8 +17,8 @@ CREATE TABLE IF NOT EXISTS fin_core.dim_customers_scd2 (
     marital_status STRING,
     effective_start_date TIMESTAMP,
     effective_end_date TIMESTAMP,
-    is_active BOOLEAN
-) STORED AS ORC;
+    is_active BOOL
+);
 
 -- View logic to do an SCD 2 transform over yesterday's active snapshot vs today's delta update
 DROP VIEW IF EXISTS default.vw_scd_transform_stg;
@@ -43,7 +43,7 @@ incoming_updates AS (
     FROM (
         SELECT *, ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY timestamp DESC) as rn
         FROM fin_landing.customer_updates
-        WHERE to_date(timestamp) = '2024-01-01'
+        WHERE DATE(timestamp) = '2024-01-01'
     ) t WHERE rn = 1
 )
 
@@ -86,7 +86,7 @@ FROM incoming_updates i
 FULL OUTER JOIN active_records a ON i.customer_id = a.customer_id;
 
 -- 1. Insert the retired rows (closing the effective_end_date and setting is_active = false)
-INSERT INTO TABLE fin_core.dim_customers_scd2
+INSERT INTO fin_core.dim_customers_scd2
 SELECT 
     old_sk,
     customer_id,
@@ -98,15 +98,15 @@ SELECT
     marital_status_old,
     old_start_date,
     CAST('2024-01-01 00:00:00' AS TIMESTAMP) AS effective_end_date,
-    false AS is_active
+    FALSE AS is_active
 FROM default.vw_scd_transform_stg
 WHERE change_type = 'UPDATE';
 
 -- 2. Insert the completely NEW rows, and the NEW ACTIVE instances of updated rows
-INSERT INTO TABLE fin_core.dim_customers_scd2
+INSERT INTO fin_core.dim_customers_scd2
 SELECT 
     -- Generate new Surrogate Key (UUID)
-    reflect("java.util.UUID", "randomUUID") AS customer_surrogate_key,
+    GENERATE_UUID() AS customer_surrogate_key,
     customer_id,
     first_name_new,
     last_name_new,
@@ -116,7 +116,7 @@ SELECT
     marital_status_new,
     CAST('2024-01-01 00:00:00' AS TIMESTAMP) AS effective_start_date,
     CAST('9999-12-31 23:59:59' AS TIMESTAMP) AS effective_end_date,
-    true AS is_active
+    TRUE AS is_active
 FROM default.vw_scd_transform_stg
 WHERE change_type IN ('INSERT', 'UPDATE');
 
