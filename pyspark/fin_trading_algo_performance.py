@@ -1,206 +1,472 @@
-from pyspark.sql import SparkSession
-import pyspark.sql.functions as F
-from pyspark.sql.window import Window
-import datetime
-import pytz
-import sys
+Converting a PySpark/Postgres solution to C#/BigQuery involves a fundamental shift in paradigm: from a DataFrame API-centric, distributed processing framework to a client-side C# application that orchestrates SQL queries against a serverless, columnar database like BigQuery.
 
-class AlgorithmicTradingPerformance:
-    """
-    Simulates high-frequency trading performance evaluation. 
-    It joins order logs (acks, fills, closures) with market data ticks to evaluate 
-    slippage (PL), opportunity costs, and VWAP (Volume-Weighted Average Price) differences.
-    """
+Here's the C# equivalent, broken down into parts:
 
-    def local_to_utc_time(self, hour, minute, date_str, tz='America/New_York'):
-        local_tz = pytz.timezone(tz)
-        date_obj = datetime.datetime.strptime(date_str, '%Y-%m-%d').date()
-        local_datetime = local_tz.localize(
-            datetime.datetime.combine(date_obj, datetime.time(hour, minute))
-        )
-        return local_datetime.astimezone(pytz.utc).strftime('%Y-%m-%d %H:%M:%S')
+**Key Changes and Considerations:**
 
-    def execute_pipeline(self, spark: SparkSession, run_date: str):
-        
-        # 1. Load Core Datasets
-        all_order_events_df = spark.read.parquet("hdfs://trading_events_base/")
-        parent_orders_df = spark.read.parquet("hdfs://parent_orders/")
+1.  **SparkSession -> BigQueryClient:** The `SparkSession` is replaced by `Google.Cloud.BigQuery.V2.BigQueryClient`.
+2.  **DataFrame Operations -> SQL Queries (CTEs):** PySpark DataFrame transformations (`filter`, `groupBy`, `withColumn`, `join`, `agg`, `window`) are translated into BigQuery SQL queries, primarily using Common Table Expressions (CTEs) for readability and modularity.
+3.  **HDFS Paths -> BigQuery Tables:** `hdfs://...` paths are replaced by fully qualified BigQuery table references (`project.dataset.table`).
+4.  **Date/Time Handling:** Python `datetime` and `pytz` are replaced by C# `DateTime`, `DateTimeOffset`, and `TimeZoneInfo`, as well as BigQuery's rich `TIMESTAMP` functions.
+5.  **`monotonically_increasing_id()`:** BigQuery does not have a direct equivalent for this *across the entire dataset in a deterministic, ordered fashion* like Spark does. For unique row identifiers within a query context, `GENERATE_UUID()` is used, or in some cases, `ROW_NUMBER()` within specific partitions. In this case, `GENERATE_UUID()` is suitable for `order_pk` to join back to quotes.
+6.  **`F.expr("...")` and `F.when(...)`:** These map directly to SQL syntax (`CASE WHEN ... THEN ... END`, `INTERVAL`, `TIMESTAMP_SUB`, etc.).
+7.  **`repartition()` and `sortWithinPartitions()`:** These are Spark-specific optimization hints. BigQuery handles query optimization internally; these do not have direct SQL equivalents that you explicitly write in the query.
+8.  **Output:** Instead of writing Parquet to HDFS, the results are written to a new BigQuery table.
+9.  **Error Handling:** C# uses `try-catch` for exceptions, and `Environment.Exit` for application termination.
 
-        # 2. Separate Event Stream into Fills
-        # Anonymized protocol filtering conceptually representing status flags
-        fills_df = all_order_events_df.filter(
-            ((F.col("protocol_version") == "V1") & (F.col("status").isin("FILLED", "PARTIAL")) & (F.col("event_type") == "TRADE"))
-            | ((F.col("protocol_version") >= "V2") & (F.col("event_type") == "FILL"))
-        )
+---
 
-        # Get the closing fill price per order
-        close_fill_price_df = (fills_df
-            .withColumn("rn", F.row_number().over(Window.partitionBy("order_id", "client_id").orderBy("event_timestamp")))
-            .filter(F.col("rn") == 1)
-            .select(
-                F.col("order_id").alias("close_order_id"), 
-                F.col("client_id").alias("close_client_id"), 
-                F.col("last_exec_price").alias("closing_price"), 
-                F.col("last_exec_qty").alias("closing_qty")
+### **1. C# Project Setup**
+
+Create a new C# Console Application project.
+
+Install the necessary NuGet package:
+
+```bash
+dotnet add package Google.Cloud.BigQuery.V2
+dotnet add package NodaTime.TimeZones # For better timezone support, or stick to System.TimeZoneInfo
+```
+
+**Authentication:**
+For `Google.Cloud.BigQuery.V2` to work, you need to set up authentication. The most common way is to set the `GOOGLE_APPLICATION_CREDENTIALS` environment variable to the path of your service account key JSON file.
+
+```bash
+# Example for Linux/macOS
+export GOOGLE_APPLICATION_CREDENTIALS="/path/to/your/keyfile.json"
+
+# Example for Windows PowerShell
+$env:GOOGLE_APPLICATION_CREDENTIALS="C:\path\to\your\keyfile.json"
+```
+
+---
+
+### **2. C# Code (`AlgorithmicTradingPerformance.cs`)**
+
+```csharp
+using Google.Cloud.BigQuery.V2;
+using System;
+using System.Text;
+using System.Globalization;
+using System.Collections.Generic;
+using System.Linq;
+
+public class AlgorithmicTradingPerformance
+{
+    private readonly BigQueryClient _bigQueryClient;
+    private readonly string _projectId; // Your Google Cloud Project ID
+    private readonly string _datasetId; // Your BigQuery Dataset ID
+    private readonly string _outputTableId = "trading_performance_analysis"; // Output table name
+
+    // BigQuery Table Names
+    private const string TradingEventsBaseTable = "trading_events_base";
+    private const string ParentOrdersTable = "parent_orders";
+    private const string Level1QuotesTable = "level1_quotes";
+    private const string MarketTradesTable = "market_trades";
+
+    public AlgorithmicTradingPerformance(BigQueryClient bigQueryClient, string projectId, string datasetId)
+    {
+        _bigQueryClient = bigQueryClient ?? throw new ArgumentNullException(nameof(bigQueryClient));
+        _projectId = projectId ?? throw new ArgumentNullException(nameof(projectId));
+        _datasetId = datasetId ?? throw new ArgumentNullException(nameof(datasetId));
+    }
+
+    /// <summary>
+    /// Converts a local time (hour, minute) on a given date string to a UTC timestamp string.
+    /// </summary>
+    /// <param name="hour">Hour of the day (0-23).</param>
+    /// <param name="minute">Minute of the hour (0-59).</param>
+    /// <param name="dateStr">Date string in YYYY-MM-DD format.</param>
+    /// <param name="tzId">Time zone ID, e.g., "America/New_York".</param>
+    /// <returns>UTC timestamp string in YYYY-MM-DD HH:mm:ss format.</returns>
+    public string LocalToUtcTime(int hour, int minute, string dateStr, string tzId = "America/New_York")
+    {
+        // Using NodaTime.TimeZones for better cross-platform timezone handling
+        // Fallback to System.TimeZoneInfo if NodaTime is not used.
+        try
+        {
+            var zone = NodaTime.DateTimeZoneProviders.Tzdb.GetZoneOrNull(tzId);
+            if (zone == null)
+            {
+                // Fallback for systems where TZDB might not be fully configured or NodaTime isn't desired.
+                // Note: System.TimeZoneInfo uses Windows/system-specific IDs (e.g., "Eastern Standard Time" for EST)
+                // A mapping might be needed or different TZID needs to be passed
+                Console.WriteLine($"Warning: TimeZoneId '{tzId}' not found via NodaTime. Falling back to System.TimeZoneInfo potentially.");
+                return ConvertWithSystemTimeZoneInfo(hour, minute, dateStr, "Eastern Standard Time"); // Example fallback
+            }
+
+            var date = NodaTime.LocalDate.Parse(dateStr, CultureInfo.InvariantCulture);
+            var localTime = date.At(new NodaTime.LocalTime(hour, minute));
+            var zonedTime = zone.AtLeniently(localTime);
+            return zonedTime.ToDateTimeUtc().ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error converting time using NodaTime, attempting System.TimeZoneInfo: {ex.Message}");
+            // System.TimeZoneInfo has different IDs (e.g., "Eastern Standard Time")
+            // This would require a mapping or specific ID to be passed.
+            // For "America/New_York", on Windows, it's often "Eastern Standard Time"
+            return ConvertWithSystemTimeZoneInfo(hour, minute, dateStr, "Eastern Standard Time");
+        }
+    }
+
+    private string ConvertWithSystemTimeZoneInfo(int hour, int minute, string dateStr, string windowsTzId)
+    {
+        DateTime dateObj = DateTime.ParseExact(dateStr, "yyyy-MM-dd", CultureInfo.InvariantCulture);
+        DateTime localDateTime = new DateTime(dateObj.Year, dateObj.Month, dateObj.Day, hour, minute, 0);
+
+        TimeZoneInfo localTimeZone;
+        try
+        {
+            // For Unix/macOS, use 'America/New_York'. For Windows, use 'Eastern Standard Time'.
+            localTimeZone = OperatingSystem.IsWindows() 
+                ? TimeZoneInfo.FindSystemTimeZoneById(windowsTzId) 
+                : TimeZoneInfo.FindSystemTimeZoneById("America/New_York");
+        }
+        catch (TimeZoneNotFoundException)
+        {
+            Console.WriteLine($"Error: TimeZone '{windowsTzId}' or 'America/New_York' not found on this system.");
+            throw; // Re-throw or handle appropriately
+        }
+
+        DateTime utcDateTime = TimeZoneInfo.ConvertTimeToUtc(localDateTime, localTimeZone);
+        return utcDateTime.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture);
+    }
+
+
+    /// <summary>
+    /// Executes the algorithmic trading performance analysis pipeline.
+    /// </summary>
+    /// <param name="runDate">The date for which to run the analysis, format YYYY-MM-DD.</param>
+    public void ExecutePipeline(string runDate)
+    {
+        Console.WriteLine($"Starting algorithmic trading performance pipeline for date: {runDate}");
+
+        // Fully qualified table names
+        string tradingEventsBaseFQN = $"{_projectId}.{_datasetId}.{TradingEventsBaseTable}";
+        string parentOrdersFQN = $"{_projectId}.{_datasetId}.{ParentOrdersTable}";
+        string level1QuotesFQN = $"{_projectId}.{_datasetId}.{Level1QuotesTable}";
+        string marketTradesFQN = $"{_projectId}.{_datasetId}.{MarketTradesTable}";
+        string outputTableFQN = $"{_projectId}.{_datasetId}.{_outputTableId}_{runDate.Replace("-", "")}"; // Suffix with date for unique output
+
+        // Calculate UTC market open/close times
+        string utcTimeMarketOpen = LocalToUtcTime(9, 30, runDate);
+        string utcTimeMarketClose = LocalToUtcTime(16, 0, runDate);
+
+        Console.WriteLine($"UTC Market Open: {utcTimeMarketOpen}");
+        Console.WriteLine($"UTC Market Close: {utcTimeMarketClose}");
+
+        StringBuilder queryBuilder = new StringBuilder();
+        queryBuilder.AppendLine($"WITH");
+
+        // 1. Separate Event Stream into Fills
+        queryBuilder.AppendLine($@"
+        fills_df AS (
+            SELECT *
+            FROM `{tradingEventsBaseFQN}`
+            WHERE
+                (protocol_version = 'V1' AND status IN ('FILLED', 'PARTIAL') AND event_type = 'TRADE')
+                OR (protocol_version >= 'V2' AND event_type = 'FILL')
+        ),");
+
+        // Get the closing fill price per order
+        queryBuilder.AppendLine($@"
+        close_fill_price_df AS (
+            SELECT
+                order_id AS close_order_id,
+                client_id AS close_client_id,
+                last_exec_price AS closing_price,
+                last_exec_qty AS closing_qty
+            FROM (
+                SELECT
+                    *,
+                    ROW_NUMBER() OVER (PARTITION BY order_id, client_id ORDER BY event_timestamp) as rn
+                FROM fills_df
             )
-            .drop("rn"))
+            WHERE rn = 1
+        ),");
 
-        # Aggregate fills per order
-        fills_agg_df = (fills_df
-            .groupBy("order_id", "client_id", "trade_date")
-            .agg(
-                F.least(F.min("event_timestamp"), F.min("routing_timestamp")).alias("FillStartTime"),
-                F.min("event_timestamp").alias("FirstFillTime"),
-                F.sum("last_exec_qty").alias("TotalSharesExecuted"),
-                F.count("last_exec_qty").alias("NumberOfFills"),
-                (F.sum(F.col("last_exec_qty") * F.col("last_exec_price")) / F.sum("last_exec_qty")).alias("AverageExecutionPrice"),
-                F.sum(F.col("last_exec_qty") * F.col("last_exec_price")).alias("TotalMarketValueExecuted"),
-            ))
+        // Aggregate fills per order
+        queryBuilder.AppendLine($@"
+        fills_agg_df AS (
+            SELECT
+                order_id,
+                client_id,
+                trade_date,
+                LEAST(MIN(event_timestamp), MIN(routing_timestamp)) AS fill_FillStartTime,
+                MIN(event_timestamp) AS fill_FirstFillTime,
+                SUM(last_exec_qty) AS fill_TotalSharesExecuted,
+                COUNT(last_exec_qty) AS fill_NumberOfFills,
+                SAFE_DIVIDE(SUM(last_exec_qty * last_exec_price), SUM(last_exec_qty)) AS fill_AverageExecutionPrice,
+                SUM(last_exec_qty * last_exec_price) AS fill_TotalMarketValueExecuted
+            FROM fills_df
+            GROUP BY 1, 2, 3
+        ),");
             
-        # Prefix columns for joins
-        for col_name in fills_agg_df.columns:
-            if col_name not in ['order_id', 'client_id', 'trade_date']:
-                fills_agg_df = fills_agg_df.withColumnRenamed(col_name, "fill_" + col_name)
+        // 3. Execution Acknowledgements
+        queryBuilder.AppendLine($@"
+        acks_agg_df AS (
+            SELECT
+                order_id,
+                client_id,
+                trade_date,
+                LEAST(MIN(event_timestamp), MIN(routing_timestamp)) AS ack_AckStartTime
+            FROM `{tradingEventsBaseFQN}`
+            WHERE status IN ('NEW', 'REPLACED') AND event_type = 'ACK'
+            GROUP BY 1, 2, 3
+        ),");
 
-        # 3. Execution Acknowledgements
-        acks_df = all_order_events_df.filter(F.col("status").isin("NEW", "REPLACED") & (F.col("event_type") == "ACK"))
-        acks_agg_df = (acks_df
-            .groupBy("order_id", "client_id", "trade_date")
-            .agg(F.least(F.min("event_timestamp"), F.min("routing_timestamp")).alias("AckStartTime")))
+        // 4. Execution Terminations
+        queryBuilder.AppendLine($@"
+        terminations_agg_df AS (
+            SELECT
+                order_id,
+                client_id,
+                trade_date,
+                GREATEST(MAX(event_timestamp), MAX(routing_timestamp)) AS term_ExecutionEndTime
+            FROM `{tradingEventsBaseFQN}`
+            WHERE status IN ('CANCELED', 'DONE_FOR_DAY', 'EXPIRED', 'REJECTED')
+            GROUP BY 1, 2, 3
+        ),");
+
+        // 5. Bring it back to Parent Orders (enriched_orders_df)
+        queryBuilder.AppendLine($@"
+        enriched_orders_intermediate AS (
+            SELECT
+                p.*,
+                f.fill_FillStartTime,
+                f.fill_FirstFillTime,
+                f.fill_TotalSharesExecuted,
+                f.fill_NumberOfFills,
+                f.fill_AverageExecutionPrice,
+                f.fill_TotalMarketValueExecuted,
+                a.ack_AckStartTime,
+                t.term_ExecutionEndTime,
+                c.closing_price,
+                c.closing_qty
+            FROM `{parentOrdersFQN}` AS p
+            LEFT JOIN fills_agg_df AS f
+                ON p.order_id = f.order_id AND p.client_id = f.client_id
+            LEFT JOIN acks_agg_df AS a
+                ON p.order_id = a.order_id AND p.client_id = a.client_id
+            LEFT JOIN terminations_agg_df AS t
+                ON p.order_id = t.order_id AND p.client_id = t.client_id
+            LEFT JOIN close_fill_price_df AS c
+                ON p.order_id = c.close_order_id AND p.client_id = c.close_client_id
+        ),
+        enriched_orders_df AS (
+            SELECT
+                *,
+                GENERATE_UUID() AS order_pk, -- Added for unique row identification later
+                LEAST(GREATEST(ack_AckStartTime, TIMESTAMP(@utc_market_open_time)), fill_FillStartTime) AS EffectiveStartTime,
+                LEAST(term_ExecutionEndTime, TIMESTAMP(@utc_market_close_time)) AS EffectiveEndTime
+            FROM enriched_orders_intermediate
+        ),");
+
+        // 6. Market Data Tick Metrics (complex time-based joins - nearest quotes)
+        // This maps the find_nearest_quote logic into CTEs
+        queryBuilder.AppendLine($@"
+        start_quotes_cte AS (
+            SELECT
+                e.order_pk,
+                q.best_bid AS start_best_bid,
+                q.best_ask AS start_best_ask,
+                q.quote_timestamp AS start_quote_timestamp
+            FROM enriched_orders_df AS e
+            JOIN `{level1QuotesFQN}` AS q
+                ON e.ticker = q.ticker
+               AND q.quote_timestamp BETWEEN TIMESTAMP_SUB(e.EffectiveStartTime, INTERVAL 10 MINUTE) AND e.EffectiveStartTime
+            QUALIFY ROW_NUMBER() OVER (PARTITION BY e.order_pk ORDER BY ABS(UNIX_MICROS(e.EffectiveStartTime) - UNIX_MICROS(q.quote_timestamp))) = 1
+        ),
+        end_quotes_cte AS (
+            SELECT
+                e.order_pk,
+                q.best_bid AS end_best_bid,
+                q.best_ask AS end_best_ask
+            FROM enriched_orders_df AS e
+            JOIN `{level1QuotesFQN}` AS q
+                ON e.ticker = q.ticker
+               AND q.quote_timestamp BETWEEN TIMESTAMP_SUB(e.EffectiveEndTime, INTERVAL 10 MINUTE) AND e.EffectiveEndTime
+            QUALIFY ROW_NUMBER() OVER (PARTITION BY e.order_pk ORDER BY ABS(UNIX_MICROS(e.EffectiveEndTime) - UNIX_MICROS(q.quote_timestamp))) = 1
+        ),
+        end_1m_quotes_cte AS (
+            SELECT
+                e.order_pk,
+                q.best_bid AS end_plus1_best_bid,
+                q.best_ask AS end_plus1_best_ask
+            FROM enriched_orders_df AS e
+            JOIN `{level1QuotesFQN}` AS q
+                ON e.ticker = q.ticker
+               AND q.quote_timestamp BETWEEN TIMESTAMP_SUB(TIMESTAMP_ADD(e.EffectiveEndTime, INTERVAL 1 MINUTE), INTERVAL 10 MINUTE) AND TIMESTAMP_ADD(e.EffectiveEndTime, INTERVAL 1 MINUTE)
+            QUALIFY ROW_NUMBER() OVER (PARTITION BY e.order_pk ORDER BY ABS(UNIX_MICROS(TIMESTAMP_ADD(e.EffectiveEndTime, INTERVAL 1 MINUTE)) - UNIX_MICROS(q.quote_timestamp))) = 1
+        ),");
+
+        // 7. Core VWAP during order existence
+        queryBuilder.AppendLine($@"
+        vwap_df AS (
+            SELECT
+                e.order_id,
+                e.client_id,
+                SUM(t.trade_size) AS market_interval_volume,
+                SAFE_DIVIDE(SUM(t.trade_price * t.trade_size), SUM(t.trade_size)) AS market_interval_vwap
+            FROM enriched_orders_df AS e
+            INNER JOIN `{marketTradesFQN}` AS t
+                ON e.ticker = t.ticker
+               AND t.trade_timestamp >= e.EffectiveStartTime
+               AND t.trade_timestamp <= e.EffectiveEndTime
+            GROUP BY e.order_id, e.client_id
+        )
+        ");
+
+        // Final Join and Calculations (similar to final_df in PySpark)
+        queryBuilder.AppendLine($@"
+        SELECT
+            e.* EXCEPT (order_pk, Start_lower, End_lower, End_plus1, End_plus1_lower, End_plus5, End_plus5_lower), -- Exclude internal Pk and temp window bounds from final output
+            vw.market_interval_volume,
+            vw.market_interval_vwap,
+            sq.start_best_bid,
+            sq.start_best_ask,
+            sq.start_quote_timestamp,
+            eq.end_best_bid,
+            eq.end_best_ask,
+            eq1m.end_plus1_best_bid,
+            eq1m.end_plus1_best_ask,
+            -- Derived calculations
+            SAFE_DIVIDE((sq.start_best_bid + sq.start_best_ask), 2) AS arrival_mid_price,
+            CASE e.side
+                WHEN 'BUY' THEN SAFE_DIVIDE((e.fill_AverageExecutionPrice - vw.market_interval_vwap), vw.market_interval_vwap) * 10000
+                WHEN 'SELL' THEN SAFE_DIVIDE((vw.market_interval_vwap - e.fill_AverageExecutionPrice), vw.market_interval_vwap) * 10000
+                ELSE NULL
+            END AS slippage_from_vwap_bps,
+            CASE e.side
+                WHEN 'BUY' THEN (SAFE_DIVIDE((sq.start_best_bid + sq.start_best_ask), 2) - e.fill_AverageExecutionPrice) * e.fill_TotalSharesExecuted
+                WHEN 'SELL' THEN (e.fill_AverageExecutionPrice - SAFE_DIVIDE((sq.start_best_bid + sq.start_best_ask), 2)) * e.fill_TotalSharesExecuted
+                ELSE NULL
+            END AS implementation_shortfall_pl,
+            CASE e.side
+                WHEN 'BUY' THEN (SAFE_DIVIDE((eq1m.end_plus1_best_bid + eq1m.end_plus1_best_ask), 2) - SAFE_DIVIDE((eq.end_best_bid + eq.end_best_ask), 2)) * e.fill_TotalSharesExecuted
+                WHEN 'SELL' THEN (SAFE_DIVIDE((eq.end_best_bid + eq.end_best_ask), 2) - SAFE_DIVIDE((eq1m.end_plus1_best_bid + eq1m.end_plus1_best_ask), 2)) * e.fill_TotalSharesExecuted
+                ELSE NULL
+            END AS post_trade_1m_momentum,
+            CASE e.side
+                WHEN 'BUY' THEN (e.requested_shares - e.fill_TotalSharesExecuted) * (e.fill_AverageExecutionPrice - e.closing_price)
+                WHEN 'SELL' THEN (e.requested_shares - e.fill_TotalSharesExecuted) * (e.closing_price - e.fill_AverageExecutionPrice)
+                ELSE NULL
+            END AS opportunity_cost_pl
+        FROM enriched_orders_df AS e
+        LEFT JOIN vwap_df AS vw ON e.order_id = vw.order_id AND e.client_id = vw.client_id
+        LEFT JOIN start_quotes_cte AS sq ON e.order_pk = sq.order_pk
+        LEFT JOIN end_quotes_cte AS eq ON e.order_pk = eq.order_pk
+        LEFT JOIN end_1m_quotes_cte AS eq1m ON e.order_pk = eq1m.order_pk
+        ");
+        
+        string sqlQuery = queryBuilder.ToString();
+
+        // Prepare BigQuery parameters
+        var parameters = new List<BigQueryParameter>
+        {
+            new BigQueryParameter("utc_market_open_time", BigQueryDbType.Timestamp, DateTime.ParseExact(utcTimeMarketOpen, "yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal)),
+            new BigQueryParameter("utc_market_close_time", BigQueryDbType.Timestamp, DateTime.ParseExact(utcTimeMarketClose, "yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal))
+        };
+        
+        // Configure the query job to write results to a new table
+        var queryJobConfig = new QueryJobConfiguration(sqlQuery, parameters)
+        {
+            DestinationTable = _bigQueryClient.GetTableReference(outputTableFQN),
+            WriteDisposition = WriteDisposition.WriteTruncate, // Overwrite the table if it exists
+            CreateDisposition = CreateDisposition.CreateTableIfNeeded // Create table if it doesn't exist
+        };
+
+        try
+        {
+            Console.WriteLine("Submitting BigQuery job...");
+            BigQueryJob job = _bigQueryClient.CreateQueryJob(queryJobConfig, JobFields.Status);
+            job.PollUntilCompleted();
+
+            if (job.Status.ErrorResult != null)
+            {
+                Console.WriteLine($"BigQuery job failed: {job.Status.ErrorResult.Message}");
+                if (job.Status.Errors != null)
+                {
+                    foreach (var error in job.Status.Errors)
+                    {
+                        Console.WriteLine($"- {error.Message} (Reason: {error.Reason})");
+                    }
+                }
+                throw new Exception("BigQuery job failed.");
+            }
+
+            Console.WriteLine($"Performance analysis complete. Results written to BigQuery table: {outputTableFQN}");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"An error occurred during BigQuery operation: {ex.Message}");
+            throw; // Re-throw for further error handling upstream if desired
+        }
+    }
+}
+```
+
+---
+
+### **3. C# Entry Point (`Program.cs`)**
+
+```csharp
+using Google.Cloud.BigQuery.V2;
+using System;
+using System.Linq;
+
+public class Program
+{
+    private const string ProjectId = "your-gcp-project-id"; // IMPORTANT: Replace with your GCP project ID
+    private const string DatasetId = "your_bigquery_dataset_id"; // IMPORTANT: Replace with your BigQuery dataset ID
+
+    public static void Main(string[] args)
+    {
+        if (args.Length < 1)
+        {
+            Console.WriteLine("Usage: dotnet run <run_date_YYYY-MM-DD>");
+            Environment.Exit(1);
+        }
+
+        string runDate = args[0];
+
+        try
+        {
+            // Initialize BigQueryClient (authentication is typically handled via GOOGLE_APPLICATION_CREDENTIALS)
+            BigQueryClient client = BigQueryClient.Create(ProjectId);
             
-        for col_name in acks_agg_df.columns:
-            if col_name not in ['order_id', 'client_id', 'trade_date']:
-                acks_agg_df = acks_agg_df.withColumnRenamed(col_name, "ack_" + col_name)
+            AlgorithmicTradingPerformance analyzer = new AlgorithmicTradingPerformance(client, ProjectId, DatasetId);
+            analyzer.ExecutePipeline(runDate);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Fatal error: {ex.Message}");
+            Console.WriteLine(ex.StackTrace);
+            Environment.Exit(1);
+        }
+    }
+}
+```
 
-        # 4. Execution Terminations
-        terminations_df = all_order_events_df.filter(F.col("status").isin("CANCELED", "DONE_FOR_DAY", "EXPIRED", "REJECTED"))
-        terminations_agg_df = (terminations_df
-            .groupBy("order_id", "client_id", "trade_date")
-            .agg(F.greatest(F.max("event_timestamp"), F.max("routing_timestamp")).alias("ExecutionEndTime")))
-            
-        for col_name in terminations_agg_df.columns:
-            if col_name not in ['order_id', 'client_id', 'trade_date']:
-                terminations_agg_df = terminations_agg_df.withColumnRenamed(col_name, "term_" + col_name)
+---
 
-        # 5. Bring it back to Parent Orders
-        enriched_orders_df = (
-            parent_orders_df.alias("p")
-            .join(fills_agg_df.alias("f"), (F.col("p.order_id") == F.col("f.order_id")) & (F.col("p.client_id") == F.col("f.client_id")), "left")
-            .join(acks_agg_df.alias("a"), (F.col("p.order_id") == F.col("a.order_id")) & (F.col("p.client_id") == F.col("a.client_id")), "left")
-            .join(terminations_agg_df.alias("t"), (F.col("p.order_id") == F.col("t.order_id")) & (F.col("p.client_id") == F.col("t.client_id")), "left")
-            .join(close_fill_price_df.alias("c"), (F.col("p.order_id") == F.col("c.close_order_id")) & (F.col("p.client_id") == F.col("c.close_client_id")), "left")
-        ).drop(F.col("f.order_id"), F.col("f.client_id"), F.col("a.order_id"), F.col("a.client_id"), F.col("t.order_id"), F.col("t.client_id"), F.col("c.close_order_id"), F.col("c.close_client_id"))
+### **To Run This Code:**
 
-        utc_time_market_open = self.local_to_utc_time(9, 30, run_date)
-        utc_time_market_close = self.local_to_utc_time(16, 00, run_date)
+1.  **Replace Placeholders:** Update `ProjectId` and `DatasetId` in `Program.cs` with your actual Google Cloud Project ID and BigQuery Dataset ID.
+2.  **Configure Authentication:** Ensure your `GOOGLE_APPLICATION_CREDENTIALS` environment variable is set up correctly, pointing to a service account key with sufficient permissions (BigQuery Data Editor, BigQuery Job User).
+3.  **Create Tables in BigQuery:** Make sure you have the source tables (`trading_events_base`, `parent_orders`, `level1_quotes`, `market_trades`) in your specified dataset in BigQuery. The schema of these tables must match the columns used in the SQL query.
+    *   `event_timestamp` and `routing_timestamp` should be `TIMESTAMP`.
+    *   `trade_date` likely `DATE` or `STRING` in `YYYY-MM-DD`.
+    *   Prices, quantities, sizes are likely `NUMERIC` or `FLOAT64`.
+    *   `protocol_version`, `status`, `event_type`, `order_id`, `client_id`, `ticker`, `side` should be `STRING`.
+    *   `requested_shares` should be `INT64` or `NUMERIC`.
+4.  **Install NodaTime (Optional but Recommended for Time Zones):**
+    `dotnet add package NodaTime`
+    If you choose not to use NodaTime, the `LocalToUtcTime` method will fall back to `System.TimeZoneInfo`. Be aware that `System.TimeZoneInfo` uses different IDs for time zones (e.g., "Eastern Standard Time" on Windows instead of "America/New_York"). You might need to adjust the `windowsTzId` argument.
+5.  **Compile and Run:**
+    ```bash
+    dotnet build
+    dotnet run -- 2023-10-26 # Example run date
+    ```
 
-        # Establish effective operating window
-        enriched_orders_df = (
-            enriched_orders_df
-            .withColumn("EffectiveStartTime", F.least(F.greatest(F.col("ack_AckStartTime"), F.lit(utc_time_market_open).cast("timestamp")), F.col("fill_FillStartTime")))
-            .withColumn("EffectiveEndTime", F.least(F.col("term_ExecutionEndTime"), F.lit(utc_time_market_close).cast("timestamp")))
-        )
-
-        # 6. Market Data Tick Metrics (complex time-based joins)
-        quotes_df = spark.read.parquet("hdfs://level1_quotes/")
-
-        quotes_df = quotes_df.repartition("ticker").sortWithinPartitions("quote_timestamp")
-        enriched_orders_df = enriched_orders_df.repartition("ticker").sortWithinPartitions("EffectiveStartTime")
-
-        quotes_df = quotes_df.withColumn("quote_pk", F.monotonically_increasing_id())
-        enriched_orders_df = enriched_orders_df.withColumn("order_pk", F.monotonically_increasing_id())
-
-        # Build Window buffers for Quote lookups
-        enriched_orders_df = (enriched_orders_df
-            .withColumn("Start_lower", F.expr(f"EffectiveStartTime - interval 10 minutes"))
-            .withColumn("End_lower", F.expr(f"EffectiveEndTime - interval 10 minutes"))
-            .withColumn("End_plus1", F.expr(f"EffectiveEndTime + interval 1 minutes"))
-            .withColumn("End_plus1_lower", F.expr(f"End_plus1 - interval 10 minutes"))
-            .withColumn("End_plus5", F.expr(f"EffectiveEndTime + interval 5 minutes"))
-            .withColumn("End_plus5_lower", F.expr(f"End_plus5 - interval 10 minutes"))
-        )
-
-        # Define a closure to reuse logic for looking up the nearest quote
-        def find_nearest_quote(orders_df, quotes_df, target_time_col, lower_bound_col, prefix):
-            join_cond = (orders_df["ticker"] == quotes_df["ticker"]) & (F.col("quote_timestamp").between(F.col(lower_bound_col), F.col(target_time_col)))
-            
-            joined = (orders_df.join(quotes_df, join_cond, how="inner")
-                        .hint("merge")
-                        .withColumn("time_diff", F.abs(F.col(target_time_col) - F.col("quote_timestamp"))))
-                        
-            nearest = (joined
-                        .withColumn("rn", F.row_number().over(Window.partitionBy("order_pk").orderBy("time_diff")))
-                        .filter(F.col("rn") == 1)
-                        .drop("rn", "time_diff", "Start_lower", "End_lower", "End_plus1", "End_plus1_lower", "End_plus5", "End_plus5_lower", quotes_df["ticker"]))
-                        
-            # rename quote columns uniquely
-            for c in ["quote_timestamp", "best_bid", "best_ask"]:
-                nearest = nearest.withColumnRenamed(c, f"{prefix}_{c}")
-            return nearest
-
-        # Perform lookups
-        open_quotes = find_nearest_quote(enriched_orders_df, quotes_df, "EffectiveStartTime", "Start_lower", "start")
-        end_quotes = find_nearest_quote(enriched_orders_df, quotes_df, "EffectiveEndTime", "End_lower", "end")
-        end_1m_quotes = find_nearest_quote(enriched_orders_df, quotes_df, "End_plus1", "End_plus1_lower", "end_plus1")
-        
-        # 7. Core VWAP and Financial Performance calculations
-        trades_df = spark.read.parquet("hdfs://market_trades/")
-        
-        # VWAP during order existence
-        vwap_df = (enriched_orders_df
-            .join(trades_df, (enriched_orders_df["ticker"] == trades_df["ticker"]) &
-                             (trades_df["trade_timestamp"] >= enriched_orders_df["EffectiveStartTime"]) &
-                             (trades_df["trade_timestamp"] <= enriched_orders_df["EffectiveEndTime"]), "inner")
-            .groupBy("order_id", "client_id")
-            .agg(
-                F.sum(trades_df["trade_size"]).alias("market_interval_volume"),
-                (F.sum(trades_df["trade_price"] * trades_df["trade_size"]) / F.sum(trades_df["trade_size"])).alias("market_interval_vwap")
-            ))
-
-        # Join everything back
-        final_df = (enriched_orders_df
-            .join(vwap_df, ["order_id", "client_id"], "left")
-            # Selectively bringing fields from quote buffers
-            .join(open_quotes.select("order_pk", "start_best_bid", "start_best_ask", "start_quote_timestamp"), "order_pk", "left")
-            .join(end_quotes.select("order_pk", "end_best_bid", "end_best_ask"), "order_pk", "left")
-            .join(end_1m_quotes.select("order_pk", "end_plus1_best_bid", "end_plus1_best_ask"), "order_pk", "left")
-        )
-
-        # Calculate complex performance metrics (Slippage, Momentum, Profit/Loss vectors)
-        final_df = final_df.withColumn("arrival_mid_price", (F.col("start_best_bid") + F.col("start_best_ask")) / 2)
-        
-        # Slippage from VWAP
-        final_df = final_df.withColumn("slippage_from_vwap_bps",
-            F.when(F.col("side") == "BUY", ((F.col("fill_AverageExecutionPrice") - F.col("market_interval_vwap")) / F.col("market_interval_vwap")) * 10000)
-             .when(F.col("side") == "SELL", ((F.col("market_interval_vwap") - F.col("fill_AverageExecutionPrice")) / F.col("market_interval_vwap")) * 10000)
-        )
-
-        # Slippage from Arrival Mid (Implementation Shortfall)
-        final_df = final_df.withColumn("implementation_shortfall_pl",
-            F.when(F.col("side") == "BUY", (F.col("arrival_mid_price") - F.col("fill_AverageExecutionPrice")) * F.col("fill_TotalSharesExecuted"))
-             .when(F.col("side") == "SELL", (F.col("fill_AverageExecutionPrice") - F.col("arrival_mid_price")) * F.col("fill_TotalSharesExecuted"))
-        )
-        
-        # Momentum calculations post-trade
-        final_df = final_df.withColumn("post_trade_1m_momentum",
-            F.when(F.col("side") == "BUY", (((F.col("end_plus1_best_bid") + F.col("end_plus1_best_ask")) / 2) - ((F.col("end_best_bid") + F.col("end_best_ask")) / 2)) * F.col("fill_TotalSharesExecuted"))
-             .when(F.col("side") == "SELL", (((F.col("end_best_bid") + F.col("end_best_ask")) / 2) - ((F.col("end_plus1_best_bid") + F.col("end_plus1_best_ask")) / 2)) * F.col("fill_TotalSharesExecuted"))
-        )
-
-        final_df = final_df.withColumn("opportunity_cost_pl",
-            F.when(F.col("side") == "BUY", (F.col("requested_shares") - F.col("fill_TotalSharesExecuted")) * (F.col("fill_AverageExecutionPrice") - F.col("closing_price")))
-             .when(F.col("side") == "SELL", (F.col("requested_shares") - F.col("fill_TotalSharesExecuted")) * (F.col("closing_price") - F.col("fill_AverageExecutionPrice")))
-        )
-
-        final_df.write.parquet(f"hdfs://trading_analytics/run_date={run_date}", mode="overwrite")
-        print("Performance analysis complete.")
-
-if __name__ == "__main__":
-    import sys
-    if len(sys.argv) < 2:
-        sys.exit(1)
-    
-    spark = SparkSession.builder.appName("AlgorithmicTradingPerformance").getOrCreate()
-    p = AlgorithmicTradingPerformance()
-    p.execute_pipeline(spark, sys.argv[1])
-    spark.stop()
+This C# application will connect to BigQuery, execute the generated SQL query (as a single job that leverages BigQuery's parallelism), and write the results to a new BigQuery table.
