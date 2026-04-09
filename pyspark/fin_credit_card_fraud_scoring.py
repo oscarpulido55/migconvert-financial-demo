@@ -6,10 +6,12 @@ from pyspark.sql.types import DoubleType, IntegerType, StringType
 from pyspark.sql.window import Window
 
 def create_spark_session():
-    """Initializes and returns a Spark session with Hive Metastore support."""
+    """Initializes and returns a Spark session configured for BigQuery."""
+    # Removed enableHiveSupport() as it's specific to Hive.
+    # For BigQuery, ensure the BigQuery connector JARs are available (e.g., via --packages in spark-submit).
+    # Project and dataset details are typically handled in the read/write operations or Spark conf.
     return SparkSession.builder \
         .appName("Financial_Credit_Card_Fraud_Scoring") \
-        .enableHiveSupport() \
         .getOrCreate()
 
 # Create a custom UDF for great circle distance
@@ -33,9 +35,11 @@ def score_transactions_for_fraud(spark, execution_date):
     """
     
     # 1. Load Data
-    full_cc_trx = spark.table("fin_core.cc_transactions")
-    accounts = spark.table("fin_core.dim_accounts")
-    merchants = spark.table("fin_core.dim_merchants")
+    # Converted spark.table() to spark.read.format("bigquery").option("table", ...).load()
+    # Replace 'your_gcp_project_id' with your actual Google Cloud Project ID.
+    full_cc_trx = spark.read.format("bigquery").option("table", "your_gcp_project_id.fin_core.cc_transactions").load()
+    accounts = spark.read.format("bigquery").option("table", "your_gcp_project_id.fin_core.dim_accounts").load()
+    merchants = spark.read.format("bigquery").option("table", "your_gcp_project_id.fin_core.dim_merchants").load()
     
     # 2. Extract current day transactions
     cc_trx = full_cc_trx.filter(col("trx_date") == execution_date)
@@ -103,9 +107,13 @@ def score_transactions_for_fraud(spark, execution_date):
         "fraud_score", "is_fraud_alert", lit(execution_date).alias("scoring_date")
     )
     
+    # Converted .insertInto() to .format("bigquery").option("table", ...).save()
+    # Replace 'your_gcp_project_id' with your actual Google Cloud Project ID.
     final_output.write \
+        .format("bigquery") \
+        .option("table", "your_gcp_project_id.fin_mart.fraud_scores_daily") \
         .mode("append") \
-        .insertInto("fin_mart.fraud_scores_daily")
+        .save()
     
     print(f"Pure DataFrame Fraud scoring completed for {execution_date}")
 

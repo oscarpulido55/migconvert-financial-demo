@@ -23,8 +23,10 @@ class AlgorithmicTradingPerformance:
     def execute_pipeline(self, spark: SparkSession, run_date: str):
         
         # 1. Load Core Datasets
-        all_order_events_df = spark.read.parquet("hdfs://trading_events_base/")
-        parent_orders_df = spark.read.parquet("hdfs://parent_orders/")
+        # Converted HDFS path to BigQuery table reference. Replace 'your_gcp_project' and 'your_bigquery_dataset' with actual values.
+        all_order_events_df = spark.read.format("bigquery").option("table", "your_gcp_project.your_bigquery_dataset.trading_events_base").load()
+        # Converted HDFS path to BigQuery table reference. Replace 'your_gcp_project' and 'your_bigquery_dataset' with actual values.
+        parent_orders_df = spark.read.format("bigquery").option("table", "your_gcp_project.your_bigquery_dataset.parent_orders").load()
 
         # 2. Separate Event Stream into Fills
         # Anonymized protocol filtering conceptually representing status flags
@@ -102,7 +104,8 @@ class AlgorithmicTradingPerformance:
         )
 
         # 6. Market Data Tick Metrics (complex time-based joins)
-        quotes_df = spark.read.parquet("hdfs://level1_quotes/")
+        # Converted HDFS path to BigQuery table reference. Replace 'your_gcp_project' and 'your_bigquery_dataset' with actual values.
+        quotes_df = spark.read.format("bigquery").option("table", "your_gcp_project.your_bigquery_dataset.level1_quotes").load()
 
         quotes_df = quotes_df.repartition("ticker").sortWithinPartitions("quote_timestamp")
         enriched_orders_df = enriched_orders_df.repartition("ticker").sortWithinPartitions("EffectiveStartTime")
@@ -144,7 +147,8 @@ class AlgorithmicTradingPerformance:
         end_1m_quotes = find_nearest_quote(enriched_orders_df, quotes_df, "End_plus1", "End_plus1_lower", "end_plus1")
         
         # 7. Core VWAP and Financial Performance calculations
-        trades_df = spark.read.parquet("hdfs://market_trades/")
+        # Converted HDFS path to BigQuery table reference. Replace 'your_gcp_project' and 'your_bigquery_dataset' with actual values.
+        trades_df = spark.read.format("bigquery").option("table", "your_gcp_project.your_bigquery_dataset.market_trades").load()
         
         # VWAP during order existence
         vwap_df = (enriched_orders_df
@@ -192,7 +196,15 @@ class AlgorithmicTradingPerformance:
              .when(F.col("side") == "SELL", (F.col("requested_shares") - F.col("fill_TotalSharesExecuted")) * (F.col("closing_price") - F.col("fill_AverageExecutionPrice")))
         )
 
-        final_df.write.parquet(f"hdfs://trading_analytics/run_date={run_date}", mode="overwrite")
+        # Converted HDFS path to BigQuery table. Table name incorporates run_date.
+        # Replace 'your_gcp_project' and 'your_bigquery_dataset' with actual values.
+        # BigQuery table names do not use directory-like partitioning with slashes; a new table name
+        # per run_date or a time-partitioned table with ingestion time partitioning would be a typical strategy.
+        final_df.write.format("bigquery") \
+            .option("table", f"your_gcp_project.your_bigquery_dataset.trading_analytics_output_{run_date.replace('-', '_')}") \
+            .option("writeDisposition", "WRITE_TRUNCATE") \
+            .mode("overwrite") \
+            .save()
         print("Performance analysis complete.")
 
 if __name__ == "__main__":
@@ -200,7 +212,15 @@ if __name__ == "__main__":
     if len(sys.argv) < 2:
         sys.exit(1)
     
-    spark = SparkSession.builder.appName("AlgorithmicTradingPerformance").getOrCreate()
+    # Configured SparkSession to use the BigQuery connector.
+    # Replace 'your-gcp-project-id' with your actual Google Cloud Project ID.
+    # The 'spark-bigquery-with-dependencies_2.12:0.29.0' package is an example; ensure compatibility with your Spark and Scala versions.
+    # This package must be available to your Spark environment (e.g., via 'spark-submit --packages' or Dataproc cluster configuration).
+    spark = SparkSession.builder \
+        .appName("AlgorithmicTradingPerformance") \
+        .config("spark.jars.packages", "com.google.cloud.spark:spark-bigquery-with-dependencies_2.12:0.29.0") \
+        .config("parentProject", "your-gcp-project-id") \
+        .getOrCreate()
     p = AlgorithmicTradingPerformance()
     p.execute_pipeline(spark, sys.argv[1])
     spark.stop()
