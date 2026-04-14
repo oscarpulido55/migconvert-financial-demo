@@ -23,8 +23,10 @@ class AlgorithmicTradingPerformance:
     def execute_pipeline(self, spark: SparkSession, run_date: str):
         
         # 1. Load Core Datasets
-        all_order_events_df = spark.read.parquet("hdfs://trading_events_base/")
-        parent_orders_df = spark.read.parquet("hdfs://parent_orders/")
+        # HIVEQL HDFS path replaced with BigQuery table reference using the Spark BigQuery Connector.
+        # Ensure 'your_gcp_project.your_bq_dataset' is configured correctly for your BigQuery environment.
+        all_order_events_df = spark.read.format("bigquery").option("table", "your_gcp_project.your_bq_dataset.trading_events_base").load()
+        parent_orders_df = spark.read.format("bigquery").option("table", "your_gcp_project.your_bq_dataset.parent_orders").load()
 
         # 2. Separate Event Stream into Fills
         # Anonymized protocol filtering conceptually representing status flags
@@ -102,7 +104,8 @@ class AlgorithmicTradingPerformance:
         )
 
         # 6. Market Data Tick Metrics (complex time-based joins)
-        quotes_df = spark.read.parquet("hdfs://level1_quotes/")
+        # HIVEQL HDFS path replaced with BigQuery table reference.
+        quotes_df = spark.read.format("bigquery").option("table", "your_gcp_project.your_bq_dataset.level1_quotes").load()
 
         quotes_df = quotes_df.repartition("ticker").sortWithinPartitions("quote_timestamp")
         enriched_orders_df = enriched_orders_df.repartition("ticker").sortWithinPartitions("EffectiveStartTime")
@@ -144,7 +147,8 @@ class AlgorithmicTradingPerformance:
         end_1m_quotes = find_nearest_quote(enriched_orders_df, quotes_df, "End_plus1", "End_plus1_lower", "end_plus1")
         
         # 7. Core VWAP and Financial Performance calculations
-        trades_df = spark.read.parquet("hdfs://market_trades/")
+        # HIVEQL HDFS path replaced with BigQuery table reference.
+        trades_df = spark.read.format("bigquery").option("table", "your_gcp_project.your_bq_dataset.market_trades").load()
         
         # VWAP during order existence
         vwap_df = (enriched_orders_df
@@ -192,7 +196,11 @@ class AlgorithmicTradingPerformance:
              .when(F.col("side") == "SELL", (F.col("requested_shares") - F.col("fill_TotalSharesExecuted")) * (F.col("closing_price") - F.col("fill_AverageExecutionPrice")))
         )
 
-        final_df.write.parquet(f"hdfs://trading_analytics/run_date={run_date}", mode="overwrite")
+        # HIVEQL HDFS path replaced with BigQuery table reference.
+        # This will write to a BigQuery table named 'trading_analytics'.
+        # For date-specific outputs, you might append the run_date to the table name
+        # or configure BigQuery table partitioning using Spark BigQuery connector options.
+        final_df.write.format("bigquery").option("table", f"your_gcp_project.your_bq_dataset.trading_analytics").mode("overwrite").save()
         print("Performance analysis complete.")
 
 if __name__ == "__main__":

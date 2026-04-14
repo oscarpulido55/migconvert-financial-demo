@@ -6,11 +6,11 @@ from pyspark.sql.types import DoubleType, IntegerType, StringType
 from pyspark.sql.window import Window
 
 def create_spark_session():
-    """Initializes and returns a Spark session with Hive Metastore support."""
+    """Initializes and returns a Spark session with BigQuery support.""" # Changed comment to reflect BigQuery support
     return SparkSession.builder \
         .appName("Financial_Credit_Card_Fraud_Scoring") \
-        .enableHiveSupport() \
-        .getOrCreate()
+        .config("spark.jars.packages", "com.google.cloud.spark:spark-bigquery-with-dependencies_2.12:0.29.1") \
+        .getOrCreate() # Replaced .enableHiveSupport() with BigQuery connector package configuration. Note: The specific version of the BigQuery connector (e.g., 0.29.1) may need to be updated based on your Spark and Scala versions. Ensure proper authentication (e.g., via Google Cloud credentials or service account JSON keyfile specified in Spark configs) is set up for Spark to access BigQuery.
 
 # Create a custom UDF for great circle distance
 def haversine(lat1, lon1, lat2, lon2):
@@ -33,9 +33,9 @@ def score_transactions_for_fraud(spark, execution_date):
     """
     
     # 1. Load Data
-    full_cc_trx = spark.table("fin_core.cc_transactions")
-    accounts = spark.table("fin_core.dim_accounts")
-    merchants = spark.table("fin_core.dim_merchants")
+    full_cc_trx = spark.table("fin_core.cc_transactions") # spark.table() can be used for BigQuery tables if the SparkSession is configured with the BigQuery connector and appropriate project/dataset settings.
+    accounts = spark.table("fin_core.dim_accounts") # spark.table() can be used for BigQuery tables if the SparkSession is configured.
+    merchants = spark.table("fin_core.dim_merchants") # spark.table() can be used for BigQuery tables if the SparkSession is configured.
     
     # 2. Extract current day transactions
     cc_trx = full_cc_trx.filter(col("trx_date") == execution_date)
@@ -104,8 +104,10 @@ def score_transactions_for_fraud(spark, execution_date):
     )
     
     final_output.write \
+        .format("bigquery") \
+        .option("table", "fin_mart.fraud_scores_daily") \
         .mode("append") \
-        .insertInto("fin_mart.fraud_scores_daily")
+        .save() # Changed from .insertInto() to .format("bigquery").option("table", ...).save() for writing to BigQuery. The "fin_mart.fraud_scores_daily" string should refer to your BigQuery dataset.table identifier (e.g., "your-gcp-project.fin_mart.fraud_scores_daily" if a default project is not configured).
     
     print(f"Pure DataFrame Fraud scoring completed for {execution_date}")
 
