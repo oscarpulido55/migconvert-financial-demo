@@ -6,10 +6,15 @@ from pyspark.sql.types import DoubleType, IntegerType, StringType
 from pyspark.sql.window import Window
 
 def create_spark_session():
-    """Initializes and returns a Spark session with Hive Metastore support."""
+    # Initializes and returns a Spark session configured for BigQuery.
+    # Note: Ensure the 'spark-bigquery-connector' JAR is available in your Spark environment.
+    # (e.g., via spark.jars.packages configuration or distributed manually).
+    # 'YOUR_GCP_PROJECT_ID' and 'YOUR_GCS_TEMP_BUCKET' must be replaced with actual values.
+    # The temporary GCS bucket is required by the BigQuery connector for data staging.
     return SparkSession.builder \
         .appName("Financial_Credit_Card_Fraud_Scoring") \
-        .enableHiveSupport() \
+        .config("spark.datasource.bigquery.project", "YOUR_GCP_PROJECT_ID") \
+        .config("spark.datasource.bigquery.temporaryGcsBucket", "YOUR_GCS_TEMP_BUCKET") \
         .getOrCreate()
 
 # Create a custom UDF for great circle distance
@@ -33,9 +38,11 @@ def score_transactions_for_fraud(spark, execution_date):
     """
     
     # 1. Load Data
-    full_cc_trx = spark.table("fin_core.cc_transactions")
-    accounts = spark.table("fin_core.dim_accounts")
-    merchants = spark.table("fin_core.dim_merchants")
+    # Converted from spark.table("database.table_name") for Hive to spark.read.format("bigquery").option("table", "project.dataset.table_name").load() for BigQuery.
+    # Replace 'YOUR_GCP_PROJECT_ID' with your actual Google Cloud Project ID.
+    full_cc_trx = spark.read.format("bigquery").option("table", "YOUR_GCP_PROJECT_ID.fin_core.cc_transactions").load()
+    accounts = spark.read.format("bigquery").option("table", "YOUR_GCP_PROJECT_ID.fin_core.dim_accounts").load()
+    merchants = spark.read.format("bigquery").option("table", "YOUR_GCP_PROJECT_ID.fin_core.dim_merchants").load()
     
     # 2. Extract current day transactions
     cc_trx = full_cc_trx.filter(col("trx_date") == execution_date)
@@ -103,9 +110,13 @@ def score_transactions_for_fraud(spark, execution_date):
         "fraud_score", "is_fraud_alert", lit(execution_date).alias("scoring_date")
     )
     
+    # Converted from .insertInto("database.table_name") for Hive to .format("bigquery").option("table", "project.dataset.table_name").save() for BigQuery.
+    # Replace 'YOUR_GCP_PROJECT_ID' with your actual Google Cloud Project ID.
     final_output.write \
+        .format("bigquery") \
+        .option("table", "YOUR_GCP_PROJECT_ID.fin_mart.fraud_scores_daily") \
         .mode("append") \
-        .insertInto("fin_mart.fraud_scores_daily")
+        .save()
     
     print(f"Pure DataFrame Fraud scoring completed for {execution_date}")
 

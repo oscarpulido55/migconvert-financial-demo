@@ -23,8 +23,8 @@ class AlgorithmicTradingPerformance:
     def execute_pipeline(self, spark: SparkSession, run_date: str):
         
         # 1. Load Core Datasets
-        all_order_events_df = spark.read.parquet("hdfs://trading_events_base/")
-        parent_orders_df = spark.read.parquet("hdfs://parent_orders/")
+        all_order_events_df = spark.read.format("bigquery").option("table", "your-gcp-project-id.trading_data.trading_events_base").load()
+        parent_orders_df = spark.read.format("bigquery").option("table", "your-gcp-project-id.trading_data.parent_orders").load()
 
         # 2. Separate Event Stream into Fills
         # Anonymized protocol filtering conceptually representing status flags
@@ -102,7 +102,7 @@ class AlgorithmicTradingPerformance:
         )
 
         # 6. Market Data Tick Metrics (complex time-based joins)
-        quotes_df = spark.read.parquet("hdfs://level1_quotes/")
+        quotes_df = spark.read.format("bigquery").option("table", "your-gcp-project-id.trading_data.level1_quotes").load()
 
         quotes_df = quotes_df.repartition("ticker").sortWithinPartitions("quote_timestamp")
         enriched_orders_df = enriched_orders_df.repartition("ticker").sortWithinPartitions("EffectiveStartTime")
@@ -126,7 +126,7 @@ class AlgorithmicTradingPerformance:
             
             joined = (orders_df.join(quotes_df, join_cond, how="inner")
                         .hint("merge")
-                        .withColumn("time_diff", F.abs(F.col(target_time_col) - F.col("quote_timestamp"))))
+                        .withColumn("time_diff", F.abs(F.col(target_time_col).cast("long") - F.col("quote_timestamp").cast("long"))))
                         
             nearest = (joined
                         .withColumn("rn", F.row_number().over(Window.partitionBy("order_pk").orderBy("time_diff")))
@@ -144,7 +144,7 @@ class AlgorithmicTradingPerformance:
         end_1m_quotes = find_nearest_quote(enriched_orders_df, quotes_df, "End_plus1", "End_plus1_lower", "end_plus1")
         
         # 7. Core VWAP and Financial Performance calculations
-        trades_df = spark.read.parquet("hdfs://market_trades/")
+        trades_df = spark.read.format("bigquery").option("table", "your-gcp-project-id.trading_data.market_trades").load()
         
         # VWAP during order existence
         vwap_df = (enriched_orders_df
@@ -192,7 +192,7 @@ class AlgorithmicTradingPerformance:
              .when(F.col("side") == "SELL", (F.col("requested_shares") - F.col("fill_TotalSharesExecuted")) * (F.col("closing_price") - F.col("fill_AverageExecutionPrice")))
         )
 
-        final_df.write.parquet(f"hdfs://trading_analytics/run_date={run_date}", mode="overwrite")
+        final_df.write.format("bigquery").option("table", f"your-gcp-project-id.trading_data.trading_analytics_{run_date.replace('-', '_')}").mode("overwrite").save()
         print("Performance analysis complete.")
 
 if __name__ == "__main__":
@@ -200,7 +200,10 @@ if __name__ == "__main__":
     if len(sys.argv) < 2:
         sys.exit(1)
     
-    spark = SparkSession.builder.appName("AlgorithmicTradingPerformance").getOrCreate()
+    spark = (SparkSession.builder
+             .appName("AlgorithmicTradingPerformance")
+             .config("spark.jars.packages", "com.google.cloud.spark:spark-bigquery-with-dependencies_2.12:0.28.0")
+             .getOrCreate())
     p = AlgorithmicTradingPerformance()
     p.execute_pipeline(spark, sys.argv[1])
     spark.stop()
