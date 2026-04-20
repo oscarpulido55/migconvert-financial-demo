@@ -6,10 +6,13 @@ from pyspark.sql.types import DoubleType, IntegerType, StringType
 from pyspark.sql.window import Window
 
 def create_spark_session():
-    """Initializes and returns a Spark session with Hive Metastore support."""
+    """Initializes and returns a Spark session with BigQuery support."""
     return SparkSession.builder \
         .appName("Financial_Credit_Card_Fraud_Scoring") \
-        .enableHiveSupport() \
+        .config("spark.jars.packages", "com.google.cloud.spark:spark-bigquery-with-dependencies_2.12:0.29.0") \
+        .config("spark.cloud.google.project.id", "your_gcp_project_id") \
+        .config("spark.hadoop.google.cloud.auth.service.account.enable", "true") \
+        .config("spark.hadoop.google.cloud.auth.service.account.json.keyfile", "/path/to/your/service-account-key.json") \
         .getOrCreate()
 
 # Create a custom UDF for great circle distance
@@ -33,9 +36,9 @@ def score_transactions_for_fraud(spark, execution_date):
     """
     
     # 1. Load Data
-    full_cc_trx = spark.table("fin_core.cc_transactions")
-    accounts = spark.table("fin_core.dim_accounts")
-    merchants = spark.table("fin_core.dim_merchants")
+    full_cc_trx = spark.read.format("bigquery").option("table", "your_gcp_project_id.fin_core_dataset.cc_transactions").load()
+    accounts = spark.read.format("bigquery").option("table", "your_gcp_project_id.fin_core_dataset.dim_accounts").load()
+    merchants = spark.read.format("bigquery").option("table", "your_gcp_project_id.fin_core_dataset.dim_merchants").load()
     
     # 2. Extract current day transactions
     cc_trx = full_cc_trx.filter(col("trx_date") == execution_date)
@@ -104,8 +107,11 @@ def score_transactions_for_fraud(spark, execution_date):
     )
     
     final_output.write \
+        .format("bigquery") \
+        .option("table", "your_gcp_project_id.fin_mart_dataset.fraud_scores_daily") \
+        .option("temporaryGcsBucket", "your_gcs_temp_bucket") \
         .mode("append") \
-        .insertInto("fin_mart.fraud_scores_daily")
+        .save()
     
     print(f"Pure DataFrame Fraud scoring completed for {execution_date}")
 
