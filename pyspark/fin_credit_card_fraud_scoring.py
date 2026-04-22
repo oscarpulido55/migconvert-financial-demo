@@ -5,11 +5,18 @@ from pyspark.sql.functions import col, udf, lit, unix_timestamp, count, avg, std
 from pyspark.sql.types import DoubleType, IntegerType, StringType
 from pyspark.sql.window import Window
 
+# Required for BigQuery data interactions. Replace with your actual GCP Project ID.
+BQ_PROJECT_ID = "your_gcp_project_id"
+
 def create_spark_session():
-    """Initializes and returns a Spark session with Hive Metastore support."""
+    """Initializes and returns a Spark session configured for BigQuery."""
+    # Replaced enableHiveSupport() with BigQuery connector configuration.
+    # The 'spark.jars.packages' config downloads the BigQuery connector (replace version as needed).
+    # 'spark.sql.extensions' enables convenient DataFrameWriter/Reader .bigquery() methods.
     return SparkSession.builder \
         .appName("Financial_Credit_Card_Fraud_Scoring") \
-        .enableHiveSupport() \
+        .config("spark.jars.packages", "com.google.cloud.spark:spark-bigquery-with-dependencies_2.12:0.29.1") \
+        .config("spark.sql.extensions", "com.google.cloud.spark.bigquery.BigQuerySparkSessionExtension") \
         .getOrCreate()
 
 # Create a custom UDF for great circle distance
@@ -33,9 +40,11 @@ def score_transactions_for_fraud(spark, execution_date):
     """
     
     # 1. Load Data
-    full_cc_trx = spark.table("fin_core.cc_transactions")
-    accounts = spark.table("fin_core.dim_accounts")
-    merchants = spark.table("fin_core.dim_merchants")
+    # Converted spark.table() calls to spark.read.bigquery() for BigQuery data access.
+    # Assumes 'fin_core' is a BigQuery dataset within the specified BQ_PROJECT_ID.
+    full_cc_trx = spark.read.bigquery(f"{BQ_PROJECT_ID}.fin_core.cc_transactions")
+    accounts = spark.read.bigquery(f"{BQ_PROJECT_ID}.fin_core.dim_accounts")
+    merchants = spark.read.bigquery(f"{BQ_PROJECT_ID}.fin_core.dim_merchants")
     
     # 2. Extract current day transactions
     cc_trx = full_cc_trx.filter(col("trx_date") == execution_date)
@@ -103,9 +112,12 @@ def score_transactions_for_fraud(spark, execution_date):
         "fraud_score", "is_fraud_alert", lit(execution_date).alias("scoring_date")
     )
     
+    # Converted insertInto("fin_mart.fraud_scores_daily") to DataFrameWriter.bigquery().
+    # 'fin_mart.fraud_scores_daily' refers to a BigQuery table within BQ_PROJECT_ID.
+    # The BigQuery connector can handle table creation/schema evolution on append depending on configurations.
     final_output.write \
         .mode("append") \
-        .insertInto("fin_mart.fraud_scores_daily")
+        .bigquery(f"{BQ_PROJECT_ID}.fin_mart.fraud_scores_daily")
     
     print(f"Pure DataFrame Fraud scoring completed for {execution_date}")
 
