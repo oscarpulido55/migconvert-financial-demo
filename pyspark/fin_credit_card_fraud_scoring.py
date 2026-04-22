@@ -6,10 +6,14 @@ from pyspark.sql.types import DoubleType, IntegerType, StringType
 from pyspark.sql.window import Window
 
 def create_spark_session():
-    """Initializes and returns a Spark session with Hive Metastore support."""
+    """Initializes and returns a Spark session configured for BigQuery."""
+    # For Spark to interact with BigQuery, the 'spark-bigquery-connector' JAR is required.
+    # This configuration adds the necessary package dynamically. The version might need
+    # to be adjusted based on your Spark/Scala environment (e.g., 0.28.0 for Spark 3.x, Scala 2.12).
+    # 'enableHiveSupport()' is removed as it is specific to Hive Metastore, not BigQuery.
     return SparkSession.builder \
         .appName("Financial_Credit_Card_Fraud_Scoring") \
-        .enableHiveSupport() \
+        .config("spark.jars.packages", "com.google.cloud.spark:spark-bigquery-with-dependencies_2.12:0.28.0") \
         .getOrCreate()
 
 # Create a custom UDF for great circle distance
@@ -33,9 +37,12 @@ def score_transactions_for_fraud(spark, execution_date):
     """
     
     # 1. Load Data
-    full_cc_trx = spark.table("fin_core.cc_transactions")
-    accounts = spark.table("fin_core.dim_accounts")
-    merchants = spark.table("fin_core.dim_merchants")
+    # When reading from BigQuery, specify format "bigquery" and use the option "table"
+    # with the full table path: 'project_id.dataset_id.table_name'.
+    # Replace 'your_gcp_project_id' with your actual GCP project ID.
+    full_cc_trx = spark.read.format("bigquery").option("table", "your_gcp_project_id.fin_core.cc_transactions").load()
+    accounts = spark.read.format("bigquery").option("table", "your_gcp_project_id.fin_core.dim_accounts").load()
+    merchants = spark.read.format("bigquery").option("table", "your_gcp_project_id.fin_core.dim_merchants").load()
     
     # 2. Extract current day transactions
     cc_trx = full_cc_trx.filter(col("trx_date") == execution_date)
@@ -103,9 +110,17 @@ def score_transactions_for_fraud(spark, execution_date):
         "fraud_score", "is_fraud_alert", lit(execution_date).alias("scoring_date")
     )
     
+    # When writing to BigQuery, specify format "bigquery" and use the option "table"
+    # with the full table path. A 'temporaryGcsBucket' is often required for staging.
+    # Replace 'your_gcp_project_id' with your actual GCP project ID.
+    # Replace 'your_gcs_staging_bucket' with a GCS bucket you have permissions for.
+    # Ensure Spark's service account has BigQuery DataEditor and Storage ObjectAdmin roles.
     final_output.write \
+        .format("bigquery") \
+        .option("table", "your_gcp_project_id.fin_mart.fraud_scores_daily") \
+        .option("temporaryGcsBucket", "your_gcs_staging_bucket") \
         .mode("append") \
-        .insertInto("fin_mart.fraud_scores_daily")
+        .save()
     
     print(f"Pure DataFrame Fraud scoring completed for {execution_date}")
 
