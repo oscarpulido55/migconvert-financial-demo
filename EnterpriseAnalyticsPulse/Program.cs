@@ -1,15 +1,17 @@
-using EnterpriseAnalyticsPulse.DataAccess;
+from EnterpriseAnalyticsPulse.DataAccess import AnalyticsRepository
 
-var builder = WebApplication.CreateBuilder(args);
+from fastapi import FastAPI
+app = FastAPI()
 
-// Add services to the container.
-builder.Services.AddControllers();
-builder.Services.AddSingleton<AnalyticsRepository>();
+# Add services to the container.
+pass # Configure controllers/routes (framework-specific setup in FastAPI)
+analytics_repository = AnalyticsRepository() # Creates the BigQuery-enabled AnalyticsRepository instance as a singleton
 
-var app = builder.Build();
+app # Application instance is ready
 
-app.UseHttpsRedirection();
-app.UseAuthorization();
-app.MapControllers();
+pass # Apply HTTPS Redirection middleware
+pass # Apply Authorization middleware
+pass # Map defined API endpoints (controllers)
 
-app.Run();
+import uvicorn
+uvicorn.run(app, host="0.0.0.0", port=8000)

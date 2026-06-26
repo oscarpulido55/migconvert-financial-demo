@@ -1,95 +1,102 @@
-using Microsoft.AspNetCore.Mvc;
-using EnterpriseAnalyticsPulse.DataAccess;
-using EnterpriseAnalyticsPulse.Models;
+from datetime import datetime
+import logging
+import uuid
 
-namespace EnterpriseAnalyticsPulse.Controllers;
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import JSONResponse
 
-[ApiController]
-[Route("api/analytics")]
-public class AnalyticsController : ControllerBase
-{
-    private readonly AnalyticsRepository _repository;
-    private readonly ILogger<AnalyticsController> _logger;
+from .data_access.analytics_repository import AnalyticsRepository
+from .models import ProductPriceCorrectionRecord # Assuming Pydantic models for request bodies/responses
 
-    public AnalyticsController(AnalyticsRepository repository, ILogger<AnalyticsController> logger)
-    {
-        _repository = repository;
-        _logger = logger;
-    }
+router = APIRouter(prefix="/api/analytics", tags=["analytics"])
 
-    [HttpGet("sales-summaries/{fiscalQuarter}")]
-    public async Task<IActionResult> GetSalesSummaries(string fiscalQuarter)
-    {
-        try
-        {
-            var summaries = await _repository.GetRegionalSalesSummariesAsync(fiscalQuarter);
-            return Ok(summaries);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error fetching regional sales breakdown for {Quarter}", fiscalQuarter);
-            return StatusCode(500, new { Message = "Analytical data warehouse aggregate processing exception." });
-        }
-    }
+logger = logging.getLogger(__name__)
 
-    [HttpGet("staff-performance/{storeCode}")]
-    public async Task<IActionResult> ViewStaffSalesBreakdown(string storeCode)
-    {
-        try
-        {
-            var assessments = await _repository.AssessStaffInStorePerformanceAsync(storeCode);
-            return Ok(assessments);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error running multi database inner join across sales and HR structures.");
-            return StatusCode(500, new { Message = "Enterprise cross relational database join evaluation timeout." });
-        }
-    }
+@router.get("/sales-summaries/{fiscal_quarter}")
+async def get_sales_summaries(
+    fiscal_quarter: str,
+    repository: AnalyticsRepository = Depends(AnalyticsRepository)
+):
+    try:
+        summaries = await repository.get_regional_sales_summaries_async(fiscal_quarter)
+        return summaries
+    except Exception as ex:
+        logger.error("Error fetching regional sales breakdown for %s", fiscal_quarter, exc_info=ex)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"message": "Analytical data warehouse aggregate processing exception."}
+        )
 
-    [HttpGet("returns-intake/{divisionCode}")]
-    public async Task<IActionResult> CheckDefectiveIntakeMetrics(string divisionCode, [FromQuery] DateTime minDate)
-    {
-        try
-        {
-            int returnCount = await _repository.ExtractReconciledReturnsMetricAsync(divisionCode, minDate);
-            return Ok(new { Division = divisionCode, AnalyzedEarliest = minDate, FlaggedReturns = returnCount });
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error querying dynamic table FQN returns logs.");
-            return StatusCode(500, new { Message = "Secure data ingestion dynamic querying exception." });
-        }
-    }
+@router.get("/staff-performance/{store_code}")
+async def view_staff_sales_breakdown(
+    store_code: str,
+    repository: AnalyticsRepository = Depends(AnalyticsRepository)
+):
+    try:
+        assessments = await repository.assess_staff_in_store_performance_async(store_code)
+        return assessments
+    except Exception as ex:
+        logger.error("Error running multi database inner join across sales and HR structures.", exc_info=ex)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"message": "Enterprise cross relational database join evaluation timeout."}
+        )
 
-    [HttpPost("price-correction")]
-    public async Task<IActionResult> TriggerSimulatedPriceCorrections([FromBody] ProductPriceCorrectionRecord correction)
-    {
-        try
-        {
-            correction.CorrectionBatchToken = Guid.NewGuid();
-            await _repository.StoreCalculatedPriceVariancesAsync(correction);
-            return Created($"/api/analytics/corrections/{correction.CorrectionBatchToken}", correction);
+@router.get("/returns-intake/{division_code}")
+async def check_defective_intake_metrics(
+    division_code: str,
+    min_date: datetime,
+    repository: AnalyticsRepository = Depends(AnalyticsRepository)
+):
+    try:
+        return_count = await repository.extract_reconciled_returns_metric_async(division_code, min_date)
+        return {
+            "division": division_code,
+            "analyzed_earliest": min_date,
+            "flagged_returns": return_count
         }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error storing batch simulated price correction models.");
-            return StatusCode(500, new { Message = "Analytics master catalog write transaction failed." });
-        }
-    }
+    except Exception as ex:
+        logger.error("Error querying dynamic table FQN returns logs.", exc_info=ex)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"message": "Secure data ingestion dynamic querying exception."}
+        )
 
-    [HttpGet("audit-employee/{empNumber}")]
-    public async Task<IActionResult> InspectEmploymentStatus(string empNumber)
-    {
-        try
-        {
-            bool isActive = await _repository.VerifyCorporateWorkforceStatusAsync(empNumber);
-            return Ok(new { UniversalId = empNumber, VerifiedActive = isActive, RetrievedTimestamp = DateTime.UtcNow });
+@router.post("/price-correction")
+async def trigger_simulated_price_corrections(
+    correction: ProductPriceCorrectionRecord,
+    repository: AnalyticsRepository = Depends(AnalyticsRepository)
+):
+    try:
+        correction.correction_batch_token = uuid.uuid4()
+        await repository.store_calculated_price_variances_async(correction)
+        return JSONResponse(
+            status_code=status.HTTP_201_CREATED,
+            content=correction.model_dump(),
+            headers={"Location": f"/api/analytics/corrections/{correction.correction_batch_token}"}
+        )
+    except Exception as ex:
+        logger.error("Error storing batch simulated price correction models.", exc_info=ex)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"message": "Analytics master catalog write transaction failed."}
+        )
+
+@router.get("/audit-employee/{emp_number}")
+async def inspect_employment_status(
+    emp_number: str,
+    repository: AnalyticsRepository = Depends(AnalyticsRepository)
+):
+    try:
+        is_active = await repository.verify_corporate_workforce_status_async(emp_number)
+        return {
+            "universal_id": emp_number,
+            "verified_active": is_active,
+            "retrieved_timestamp": datetime.utcnow()
         }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error verifying personnel records against corporate HR databases.");
-            return StatusCode(500, new { Message = "Secure payroll active directory lookup failed." });
-        }
-    }
-}
+    except Exception as ex:
+        logger.error("Error verifying personnel records against corporate HR databases.", exc_info=ex)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"message": "Secure payroll active directory lookup failed."}
+        )

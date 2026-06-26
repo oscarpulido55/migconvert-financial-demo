@@ -1,27 +1,22 @@
-namespace OmniLoyaltyGateway.Models;
+@dataclass
+class MemberTierInfo:
+    member_account_code: str = ""
+    global_ranking_tier: str = ""
+    accumulated_spend_amount: Decimal = Decimal(0)
+    available_bonus_points: int = 0
+    milestone_review_date: datetime = datetime(1, 1, 1)
 
-public class MemberTierInfo
-{
-    public string MemberAccountCode { get; set; } = string.Empty;
-    public string GlobalRankingTier { get; set; } = string.Empty;
-    public decimal AccumulatedSpendAmount { get; set; }
-    public int AvailableBonusPoints { get; set; }
-    public DateTime MilestoneReviewDate { get; set; }
-}
+@dataclass
+class PromotionAssignment:
+    event_assignment_id: UUID = UUID('00000000-0000-0000-0000-000000000000')
+    member_account_code: str = ""
+    applied_promotion_code: str = ""
+    discount_calculated_percentage: Decimal = Decimal(0)
+    active_window_expires_at: datetime = datetime(1, 1, 1)
 
-public class PromotionAssignment
-{
-    public Guid EventAssignmentId { get; set; }
-    public string MemberAccountCode { get; set; } = string.Empty;
-    public string AppliedPromotionCode { get; set; } = string.Empty;
-    public decimal DiscountCalculatedPercentage { get; set; }
-    public DateTime ActiveWindowExpiresAt { get; set; }
-}
-
-public class CrossBrandSweptRewards
-{
-    public string InternalMemberHash { get; set; } = string.Empty;
-    public string GlobalRetailBrandPartnerName { get; set; } = string.Empty;
-    public decimal CrossSweepReconciledRebate { get; set; }
-    public DateTime TransactedSystemReference { get; set; }
-}
+@dataclass
+class CrossBrandSweptRewards:
+    internal_member_hash: str = ""
+    global_retail_brand_partner_name: str = ""
+    cross_sweep_reconciled_rebate: Decimal = Decimal(0)
+    transacted_system_reference: datetime = datetime(1, 1, 1)

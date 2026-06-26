@@ -7,7 +7,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="System.Data.SqlClient" Version="4.8.5" />
+    <PackageReference Include="Google.Cloud.BigQuery.V2" Version="3.9.0" /> <!-- Replaced System.Data.SqlClient with Google's BigQuery client library -->
     <PackageReference Include="Dapper" Version="2.1.28" />
   </ItemGroup>
 

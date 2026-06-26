@@ -1,15 +1,10 @@
-using OmniLoyaltyGateway.DataAccess;
+from fastapi import FastAPI
+from omnibus_loyalty_gateway.bigquery_data_access import BigQueryLoyaltyRepository
+import uvicorn
 
-var builder = WebApplication.CreateBuilder(args);
+app = FastAPI()
 
-// Add services to the container.
-builder.Services.AddControllers();
-builder.Services.AddSingleton<LoyaltyRepository>();
+def get_bigquery_loyalty_repository():
+    return BigQueryLoyaltyRepository()
 
-var app = builder.Build();
-
-app.UseHttpsRedirection();
-app.UseAuthorization();
-app.MapControllers();
-
-app.Run();
+uvicorn.run(app, host="0.0.0.0", port=8000)
