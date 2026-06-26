@@ -7,8 +7,8 @@ import sys
 
 class AlgorithmicTradingPerformance:
     """
-    Simulates high-frequency trading performance evaluation. 
-    It joins order logs (acks, fills, closures) with market data ticks to evaluate 
+    Simulates high-frequency trading performance evaluation.
+    It joins order logs (acks, fills, closures) with market data ticks to evaluate
     slippage (PL), opportunity costs, and VWAP (Volume-Weighted Average Price) differences.
     """
 
@@ -21,10 +21,10 @@ class AlgorithmicTradingPerformance:
         return local_datetime.astimezone(pytz.utc).strftime('%Y-%m-%d %H:%M:%S')
 
     def execute_pipeline(self, spark: SparkSession, run_date: str):
-        
+
         # 1. Load Core Datasets
-        all_order_events_df = spark.read.parquet("hdfs://trading_events_base/")
-        parent_orders_df = spark.read.parquet("hdfs://parent_orders/")
+        all_order_events_df = spark.read.parquet("gs://migconvert-at-next26-work-bkt/trading_events_base/")
+        parent_orders_df = spark.read.parquet("gs://migconvert-at-next26-work-bkt/parent_orders/")
 
         # 2. Separate Event Stream into Fills
         # Anonymized protocol filtering conceptually representing status flags
@@ -38,9 +38,9 @@ class AlgorithmicTradingPerformance:
             .withColumn("rn", F.row_number().over(Window.partitionBy("order_id", "client_id").orderBy("event_timestamp")))
             .filter(F.col("rn") == 1)
             .select(
-                F.col("order_id").alias("close_order_id"), 
-                F.col("client_id").alias("close_client_id"), 
-                F.col("last_exec_price").alias("closing_price"), 
+                F.col("order_id").alias("close_order_id"),
+                F.col("client_id").alias("close_client_id"),
+                F.col("last_exec_price").alias("closing_price"),
                 F.col("last_exec_qty").alias("closing_qty")
             )
             .drop("rn"))
@@ -56,7 +56,7 @@ class AlgorithmicTradingPerformance:
                 (F.sum(F.col("last_exec_qty") * F.col("last_exec_price")) / F.sum("last_exec_qty")).alias("AverageExecutionPrice"),
                 F.sum(F.col("last_exec_qty") * F.col("last_exec_price")).alias("TotalMarketValueExecuted"),
             ))
-            
+
         # Prefix columns for joins
         for col_name in fills_agg_df.columns:
             if col_name not in ['order_id', 'client_id', 'trade_date']:
@@ -67,7 +67,7 @@ class AlgorithmicTradingPerformance:
         acks_agg_df = (acks_df
             .groupBy("order_id", "client_id", "trade_date")
             .agg(F.least(F.min("event_timestamp"), F.min("routing_timestamp")).alias("AckStartTime")))
-            
+
         for col_name in acks_agg_df.columns:
             if col_name not in ['order_id', 'client_id', 'trade_date']:
                 acks_agg_df = acks_agg_df.withColumnRenamed(col_name, "ack_" + col_name)
@@ -77,7 +77,7 @@ class AlgorithmicTradingPerformance:
         terminations_agg_df = (terminations_df
             .groupBy("order_id", "client_id", "trade_date")
             .agg(F.greatest(F.max("event_timestamp"), F.max("routing_timestamp")).alias("ExecutionEndTime")))
-            
+
         for col_name in terminations_agg_df.columns:
             if col_name not in ['order_id', 'client_id', 'trade_date']:
                 terminations_agg_df = terminations_agg_df.withColumnRenamed(col_name, "term_" + col_name)
@@ -102,7 +102,7 @@ class AlgorithmicTradingPerformance:
         )
 
         # 6. Market Data Tick Metrics (complex time-based joins)
-        quotes_df = spark.read.parquet("hdfs://level1_quotes/")
+        quotes_df = spark.read.parquet("gs://migconvert-at-next26-work-bkt/level1_quotes/")
 
         quotes_df = quotes_df.repartition("ticker").sortWithinPartitions("quote_timestamp")
         enriched_orders_df = enriched_orders_df.repartition("ticker").sortWithinPartitions("EffectiveStartTime")
@@ -123,29 +123,58 @@ class AlgorithmicTradingPerformance:
         # Define a closure to reuse logic for looking up the nearest quote
         def find_nearest_quote(orders_df, quotes_df, target_time_col, lower_bound_col, prefix):
             join_cond = (orders_df["ticker"] == quotes_df["ticker"]) & (F.col("quote_timestamp").between(F.col(lower_bound_col), F.col(target_time_col)))
-            
+
             joined = (orders_df.join(quotes_df, join_cond, how="inner")
                         .hint("merge")
-                        .withColumn("time_diff", F.abs(F.col(target_time_col) - F.col("quote_timestamp"))))
-                        
+                        .withColumn("time_diff", F.abs(F.col(target_time_col).cast("long") - F.col("quote_timestamp").cast("long")))) # Cast to long for abs on timestamps
+
             nearest = (joined
                         .withColumn("rn", F.row_number().over(Window.partitionBy("order_pk").orderBy("time_diff")))
                         .filter(F.col("rn") == 1)
-                        .drop("rn", "time_diff", "Start_lower", "End_lower", "End_plus1", "End_plus1_lower", "End_plus5", "End_plus5_lower", quotes_df["ticker"]))
-                        
+                        .drop("rn", "time_diff", quotes_df["ticker"]) # Dropping buffer columns specific to this lookup after use
+                        .selectExpr(*[c for c in orders_df.columns if c not in ["Start_lower", "End_lower", "End_plus1", "End_plus1_lower", "End_plus5", "End_plus5_lower"]], *[f"quotes_df.{c}" for c in ["quote_timestamp", "best_bid", "best_ask"]])) # Only select needed quote columns from the 'joined' df after filtering
+
             # rename quote columns uniquely
             for c in ["quote_timestamp", "best_bid", "best_ask"]:
                 nearest = nearest.withColumnRenamed(c, f"{prefix}_{c}")
             return nearest
 
-        # Perform lookups
-        open_quotes = find_nearest_quote(enriched_orders_df, quotes_df, "EffectiveStartTime", "Start_lower", "start")
-        end_quotes = find_nearest_quote(enriched_orders_df, quotes_df, "EffectiveEndTime", "End_lower", "end")
-        end_1m_quotes = find_nearest_quote(enriched_orders_df, quotes_df, "End_plus1", "End_plus1_lower", "end_plus1")
-        
+        # To avoid duplicating order_pk multiple times in the joins and to manage schema size:
+        # Instead of passing the entire 'enriched_orders_df' and dropping columns dynamically,
+        # it's better to pass only 'order_pk' and 'ticker' from enriched_orders_df and join back later.
+        # This keeps the find_nearest_quote function's output minimal.
+
+        # Redefine the function to return minimal set of columns
+        def find_nearest_quote_optimized(orders_df_subset, quotes_df, target_time_col, lower_bound_col, prefix):
+            join_cond = (orders_df_subset["ticker"] == quotes_df["ticker"]) & (F.col("quote_timestamp").between(F.col(lower_bound_col), F.col(target_time_col)))
+
+            joined = (orders_df_subset.join(quotes_df, join_cond, how="inner")
+                        .hint("merge")
+                        .withColumn("time_diff", F.abs(F.col(target_time_col).cast("long") - F.col("quote_timestamp").cast("long"))))
+
+            # We only need order_pk and the relevant quote data
+            nearest = (joined
+                        .withColumn("rn", F.row_number().over(Window.partitionBy("order_pk").orderBy("time_diff")))
+                        .filter(F.col("rn") == 1)
+                        .select("order_pk", "quote_timestamp", "best_bid", "best_ask"))
+
+            # rename quote columns uniquely
+            for c in ["quote_timestamp", "best_bid", "best_ask"]:
+                nearest = nearest.withColumnRenamed(c, f"{prefix}_{c}")
+            return nearest
+
+        # Prepare a subset for lookups
+        orders_subset_for_quotes = enriched_orders_df.select("order_pk", "ticker", "EffectiveStartTime", "EffectiveEndTime",
+                                                             "Start_lower", "End_lower", "End_plus1", "End_plus1_lower", "End_plus5", "End_plus5_lower")
+
+        # Perform lookups with the optimized function
+        open_quotes = find_nearest_quote_optimized(orders_subset_for_quotes, quotes_df, "EffectiveStartTime", "Start_lower", "start")
+        end_quotes = find_nearest_quote_optimized(orders_subset_for_quotes, quotes_df, "EffectiveEndTime", "End_lower", "end")
+        end_1m_quotes = find_nearest_quote_optimized(orders_subset_for_quotes, quotes_df, "End_plus1", "End_plus1_lower", "end_plus1")
+
         # 7. Core VWAP and Financial Performance calculations
-        trades_df = spark.read.parquet("hdfs://market_trades/")
-        
+        trades_df = spark.read.parquet("gs://migconvert-at-next26-work-bkt/market_trades/")
+
         # VWAP during order existence
         vwap_df = (enriched_orders_df
             .join(trades_df, (enriched_orders_df["ticker"] == trades_df["ticker"]) &
@@ -168,7 +197,7 @@ class AlgorithmicTradingPerformance:
 
         # Calculate complex performance metrics (Slippage, Momentum, Profit/Loss vectors)
         final_df = final_df.withColumn("arrival_mid_price", (F.col("start_best_bid") + F.col("start_best_ask")) / 2)
-        
+
         # Slippage from VWAP
         final_df = final_df.withColumn("slippage_from_vwap_bps",
             F.when(F.col("side") == "BUY", ((F.col("fill_AverageExecutionPrice") - F.col("market_interval_vwap")) / F.col("market_interval_vwap")) * 10000)
@@ -180,7 +209,7 @@ class AlgorithmicTradingPerformance:
             F.when(F.col("side") == "BUY", (F.col("arrival_mid_price") - F.col("fill_AverageExecutionPrice")) * F.col("fill_TotalSharesExecuted"))
              .when(F.col("side") == "SELL", (F.col("fill_AverageExecutionPrice") - F.col("arrival_mid_price")) * F.col("fill_TotalSharesExecuted"))
         )
-        
+
         # Momentum calculations post-trade
         final_df = final_df.withColumn("post_trade_1m_momentum",
             F.when(F.col("side") == "BUY", (((F.col("end_plus1_best_bid") + F.col("end_plus1_best_ask")) / 2) - ((F.col("end_best_bid") + F.col("end_best_ask")) / 2)) * F.col("fill_TotalSharesExecuted"))
@@ -192,15 +221,30 @@ class AlgorithmicTradingPerformance:
              .when(F.col("side") == "SELL", (F.col("requested_shares") - F.col("fill_TotalSharesExecuted")) * (F.col("closing_price") - F.col("fill_AverageExecutionPrice")))
         )
 
-        final_df.write.parquet(f"hdfs://trading_analytics/run_date={run_date}", mode="overwrite")
+        # Add a date column for BigQuery partitioning
+        final_df_with_date = final_df.withColumn("report_date", F.lit(run_date).cast("date"))
+
+        final_df_with_date.write \
+            .format("bigquery") \
+            .option("table", "migconvert-at-next26.trading_analytics.performance_results") \
+            .option("project", "migconvert-at-next26") \
+            .option("dataset", "trading_analytics") \
+            .option("partitionField", "report_date") \
+            .option("partitionType", "DAY") \
+            .mode("overwrite") \
+            .save()
+
         print("Performance analysis complete.")
 
 if __name__ == "__main__":
     import sys
     if len(sys.argv) < 2:
         sys.exit(1)
-    
-    spark = SparkSession.builder.appName("AlgorithmicTradingPerformance").getOrCreate()
+
+    spark = SparkSession.builder \
+        .appName("AlgorithmicTradingPerformance") \
+        .config("spark.jars.packages", "com.google.cloud.spark:spark-bigquery-with-dependencies_2.12:0.29.0") \
+        .getOrCreate()
     p = AlgorithmicTradingPerformance()
     p.execute_pipeline(spark, sys.argv[1])
     spark.stop()
