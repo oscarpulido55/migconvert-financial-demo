@@ -1,13 +1,19 @@
+
+# Constants for BigQuery project and dataset
+PROJECT_ID = "your-gcp-project-id"  # Required: Replace with your GCP project ID where BigQuery is located
+BIGQUERY_DATASET = "fin_core"      # Required: Replace with your BigQuery dataset name. This dataset must pre-exist.
+
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, lit, current_timestamp, to_date, year, month, dayofmonth, max as spark_max, sum as spark_sum, broadcast, when, coalesce, udf, array_contains, explode
 from pyspark.sql.window import Window
 from pyspark.sql.types import StringType, DoubleType, IntegerType, StructType, StructField, ArrayType
 
 def get_spark_session():
-    """Initializes and returns a Spark session with Hive support enabled."""
+    """Initializes and returns a Spark session with BigQuery connector enabled."""
     return SparkSession.builder \
-        .appName("Financial_Customer_Onboarding_ETL") \
-        .enableHiveSupport() \
+        .appName("Financial_Customer_Onboarding_ETL_BigQuery") \
+        .config("spark.jars.packages", "com.google.cloud.spark:spark-bigquery-with-dependencies_2.12:0.29.0") \
+        .config("spark.hadoop.google.cloud.auth.service.account.enable", "true") \
         .config("spark.sql.sources.partitionOverwriteMode", "dynamic") \
         .config("spark.sql.adaptive.enabled", "true") \
         .config("spark.sql.adaptive.coalescePartitions.enabled", "true") \
@@ -16,13 +22,14 @@ def get_spark_session():
 def process_customer_onboarding(spark):
     """
     Main ETL process for customer onboarding.
-    Reads raw customer data, KYC records, and initial funding details,
-    performs complex transformations, and writes to the dimensions table.
+    Reads raw customer data, KYC records, and initial funding details from BigQuery,
+    performs complex transformations, and writes to the BigQuery dimensions table.
     """
-    # 1. Read Raw Data sources (Simulated paths in HDFS)
-    raw_customers_df = spark.read.json("hdfs://namenode:8020/landing/fin/customers/")
-    raw_kyc_df = spark.read.parquet("hdfs://namenode:8020/landing/fin/kyc_status/")
-    raw_accounts_df = spark.read.csv("hdfs://namenode:8020/landing/fin/accounts/", header=True, inferSchema=True)
+    # 1. Read Raw Data sources from BigQuery tables
+    # Converted HDFS paths to BigQuery table reads. These BigQuery tables (e.g., raw_customers) must pre-exist within the specified dataset.
+    raw_customers_df = spark.read.format("bigquery").option("table", f"{PROJECT_ID}.{BIGQUERY_DATASET}.raw_customers").load()
+    raw_kyc_df = spark.read.format("bigquery").option("table", f"{PROJECT_ID}.{BIGQUERY_DATASET}.raw_kyc_status").load()
+    raw_accounts_df = spark.read.format("bigquery").option("table", f"{PROJECT_ID}.{BIGQUERY_DATASET}.raw_accounts").load()
 
     # 2. Extract latest KYC status using Window Functions
     kyc_window = Window.partitionBy("customer_id").orderBy(col("verification_date").desc())
@@ -74,21 +81,26 @@ def process_customer_onboarding(spark):
         "onboarding_month", month(col("last_account_open_date"))
     )
 
-    # 6. Write to Managed Hive Table
-    # The target is fin_core.dim_customers partitioned by onboarding_year, onboarding_month, country_code
+    # 6. Write to BigQuery Table
+    # Converted write from Hive table (with ORC format and Spark-managed partitioning) to BigQuery table.
+    # BigQuery manages its own internal partitioning (if defined on the target table via BQ schema/creation).
+    # 'writeDisposition' with 'OVERWRITE' truncates the table before writing new data, equivalent to 'overwrite' mode.
     final_dim_customers.write \
-        .partitionBy("onboarding_year", "onboarding_month", "country_code") \
-        .format("orc") \
+        .format("bigquery") \
+        .option("table", f"{PROJECT_ID}.{BIGQUERY_DATASET}.dim_customers") \
+        .option("writeDisposition", "OVERWRITE") \
         .mode("overwrite") \
-        .saveAsTable("fin_core.dim_customers")
+        .save()
 
     print(f"Successfully processed {final_dim_customers.count()} customer records.")
 
 if __name__ == "__main__":
     spark = get_spark_session()
-    
-    # Optional: Setup DB for the demo 
-    spark.sql("CREATE DATABASE IF NOT EXISTS fin_core")
-    
+
+    # Removed Hive-specific DDL for database creation.
+    # In BigQuery, datasets (analogous to databases) are managed separately from Spark jobs.
+    # The 'fin_core' dataset must already exist in your GCP project and its location set up.
+    # spark.sql("CREATE DATABASE IF NOT EXISTS fin_core")
+
     process_customer_onboarding(spark)
     spark.stop()

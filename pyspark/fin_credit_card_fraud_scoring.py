@@ -1,121 +1,165 @@
 import sys
 import math
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, udf, lit, unix_timestamp, count, avg, stddev_samp, when, date_sub
-from pyspark.sql.types import DoubleType, IntegerType, StringType
-from pyspark.sql.window import Window
+from google.cloud import bigquery
+from google.cloud.bigquery import ScalarQueryParameter
 
-def create_spark_session():
-    """Initializes and returns a Spark session with Hive Metastore support."""
-    return SparkSession.builder \
-        .appName("Financial_Credit_Card_Fraud_Scoring") \
-        .enableHiveSupport() \
-        .getOrCreate()
+# PySpark-specific imports (SparkSession, UDF functions, types, window) are removed.
+# The functionality is replaced by direct BigQuery client operations and SQL query.
 
-# Create a custom UDF for great circle distance
-def haversine(lat1, lon1, lat2, lon2):
-    """Calculates the great circle distance between two points on the earth."""
-    if lat1 is None or lon1 is None or lat2 is None or lon2 is None:
-        return -1.0
-    R = 6371.0 # Radius of earth in km
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlambda = math.radians(lon2 - lon1)
-    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
-    return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1-a))
+# The `create_spark_session` function is removed as BigQuery operations do not use SparkSession.
 
-haversine_udf = udf(haversine, DoubleType())
+# The Python UDF `haversine` and its registration `haversine_udf` are replaced.
+# The haversine calculation is embedded directly in the BigQuery SQL query as an expression.
 
-def score_transactions_for_fraud(spark, execution_date):
+def score_transactions_for_fraud(client, execution_date): # `spark` parameter replaced by `client`
     """
-    Uses pure PySpark DataFrame APIs to score credit card transactions.
-    Replaces embedded SQL with continuous DataFrame transformations.
+    Scores credit card transactions using BigQuery SQL.
+    Replaces PySpark DataFrame API with a single, comprehensive BigQuery SQL query.
     """
-    
-    # 1. Load Data
-    full_cc_trx = spark.table("fin_core.cc_transactions")
-    accounts = spark.table("fin_core.dim_accounts")
-    merchants = spark.table("fin_core.dim_merchants")
-    
-    # 2. Extract current day transactions
-    cc_trx = full_cc_trx.filter(col("trx_date") == execution_date)
-    
-    # 3. Join location data and calculate distance Native
-    enriched_trx = cc_trx.alias("t") \
-        .join(accounts.alias("a"), col("t.account_id") == col("a.account_id"), "inner") \
-        .join(merchants.alias("m"), col("t.merchant_id") == col("m.merchant_id"), "left") \
-        .withColumn(
-            "distance_from_home_km",
-            haversine_udf(col("a.home_lat"), col("a.home_lon"), col("m.merchant_lat"), col("m.merchant_lon"))
+
+    query = f"""
+        WITH
+        -- 1. Data Loading (Conceptual: BigQuery tables are referenced directly)
+
+        -- 2. Extract current day transactions
+        cc_trx AS (
+            SELECT *
+            FROM `fin_core.cc_transactions`
+            WHERE trx_date = PARSE_DATE('%Y-%m-%d', @execution_date)
+        ),
+
+        -- 3. Join location data and calculate distance
+        enriched_trx AS (
+            SELECT
+                t.* EXCEPT (home_lat, home_lon, merchant_lat, merchant_lon), -- Exclude temporary join columns to avoid conflict
+                a.home_lat,
+                a.home_lon,
+                m.merchant_lat,
+                m.merchant_lon,
+                -- Haversine formula directly translated into BigQuery SQL expression
+                CASE
+                    WHEN a.home_lat IS NULL OR a.home_lon IS NULL OR m.merchant_lat IS NULL OR m.merchant_lon IS NULL THEN -1.0
+                    ELSE
+                        (
+                            SELECT 2 * 6371.0 * ATAN2(SQRT(a_val), SQRT(1 - a_val))
+                            FROM UNNEST([STRUCT(
+                                POWER(SIN(RADIANS(m.merchant_lat - a.home_lat)/2), 2) +
+                                COS(RADIANS(a.home_lat)) * COS(RADIANS(m.merchant_lat)) *
+                                POWER(SIN(RADIANS(m.merchant_lon - a.home_lon)/2), 2) AS a_val
+                            )])
+                        )
+                END AS distance_from_home_km
+            FROM cc_trx AS t
+            INNER JOIN `fin_core.dim_accounts` AS a ON t.account_id = a.account_id
+            LEFT JOIN `fin_core.dim_merchants` AS m ON t.merchant_id = m.merchant_id
+        ),
+
+        -- 4. Historical Profiling
+        hist_trx AS (
+            SELECT *
+            FROM `fin_core.cc_transactions`
+            WHERE
+                trx_date >= DATE_SUB(PARSE_DATE('%Y-%m-%d', @execution_date), INTERVAL 90 DAY)
+                AND trx_date <= DATE_SUB(PARSE_DATE('%Y-%m-%d', @execution_date), INTERVAL 1 DAY)
+        ),
+        hist_profile AS (
+            SELECT
+                account_id,
+                AVG(amount) AS avg_trx_amount_90d,
+                COALESCE(STDDEV_SAMP(amount), 0.0) AS stddev_trx_amount_90d, -- COALESCE replaces Spark's fillna
+                COUNT(trx_id) / 90.0 AS avg_daily_trx_count
+            FROM hist_trx
+            GROUP BY account_id
+        ),
+
+        -- 5. Join current day transactions with their historical profiles
+        df_features AS (
+            SELECT
+                curr.*,
+                hist.avg_trx_amount_90d,
+                hist.stddev_trx_amount_90d,
+                hist.avg_daily_trx_count
+            FROM enriched_trx AS curr
+            LEFT JOIN hist_profile AS hist ON curr.account_id = hist.account_id
+        ),
+
+        -- 6 & 7. Apply Window Function, Business Logic and Scoring
+        -- First CTE to calculate window functions and Z-score using BigQuery SQL functions
+        scored_df_intermediate AS (
+            SELECT
+                df_features.*,
+                COUNT(df_features.trx_id) OVER (
+                    PARTITION BY df_features.account_id
+                    ORDER BY UNIX_SECONDS(df_features.trx_timestamp) ASC
+                    RANGE BETWEEN 3600 PRECEDING AND CURRENT ROW -- 3600 seconds for 1 hour window
+                ) AS trx_last_hour_cnt,
+                CASE
+                    WHEN df_features.stddev_trx_amount_90d > 0 THEN (df_features.amount - df_features.avg_trx_amount_90d) / df_features.stddev_trx_amount_90d
+                    ELSE 0.0
+                END AS amount_z_score
+            FROM df_features
+        ),
+
+        -- Second CTE to calculate risk scores based on intermediate calculations
+        final_scoring AS (
+            SELECT
+                scored_df_intermediate.*,
+                CASE
+                    WHEN distance_from_home_km > 500 AND distance_from_home_km != -1.0 THEN 30
+                    ELSE 0
+                END AS distance_risk_score,
+                CASE
+                    WHEN amount_z_score > 3.0 THEN 40
+                    WHEN amount_z_score > 2.0 THEN 20
+                    ELSE 0
+                END AS amount_risk_score,
+                CASE
+                    WHEN trx_last_hour_cnt > 5 THEN 30
+                    WHEN trx_last_hour_cnt > 3 THEN 15
+                    ELSE 0
+                END AS velocity_risk_score
+            FROM scored_df_intermediate
         )
-        
-    # 4. Pure DataFrame Historical Profiling Window
-    # Filter for the last 90 days of transactions (excluding execution date)
-    hist_trx = full_cc_trx.filter(
-        (col("trx_date") >= date_sub(lit(execution_date), 90)) & 
-        (col("trx_date") <= date_sub(lit(execution_date), 1))
+
+        -- 8. Insert results into target table. `insertInto` replaced by `INSERT INTO` SQL statement.
+        INSERT INTO `fin_mart.fraud_scores_daily` (
+            trx_id, account_id, amount,
+            distance_from_home_km, amount_z_score, trx_last_hour_cnt,
+            fraud_score, is_fraud_alert, scoring_date
+        )
+        SELECT
+            trx_id,
+            account_id,
+            amount,
+            distance_from_home_km,
+            amount_z_score,
+            trx_last_hour_cnt,
+            (distance_risk_score + amount_risk_score + velocity_risk_score) AS fraud_score,
+            (distance_risk_score + amount_risk_score + velocity_risk_score) >= 60 AS is_fraud_alert,
+            PARSE_DATE('%Y-%m-%d', @execution_date) AS scoring_date
+        FROM final_scoring;
+    """
+
+    # Configure and run the BigQuery job
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            ScalarQueryParameter("execution_date", "STRING", execution_date),
+        ]
     )
-    
-    # Aggregate to build the historical profile
-    hist_profile = hist_trx.groupBy("account_id").agg(
-        avg("amount").alias("avg_trx_amount_90d"),
-        stddev_samp("amount").alias("stddev_trx_amount_90d"),
-        (count("trx_id") / 90.0).alias("avg_daily_trx_count")
-    ).fillna(0.0, subset=["stddev_trx_amount_90d"])
-    
-    # 5. Join current day transactions with their historical profiles
-    df_features = enriched_trx.alias("curr") \
-        .join(hist_profile.alias("hist"), col("curr.account_id") == col("hist.account_id"), "left")
-        
-    # 6. Apply Time-based Window Function (Last Hour Trx Count)
-    time_window = Window.partitionBy("curr.account_id").orderBy(unix_timestamp("curr.trx_timestamp")).rangeBetween(-3600, 0)
-    
-    # 7. Apply Complex Business Logic and Scoring Native DataFrame API
-    scored_df = df_features \
-        .withColumn("trx_last_hour_cnt", count("curr.trx_id").over(time_window)) \
-        .withColumn("amount_z_score", 
-            when(col("hist.stddev_trx_amount_90d") > 0, 
-                 (col("curr.amount") - col("hist.avg_trx_amount_90d")) / col("hist.stddev_trx_amount_90d"))
-            .otherwise(lit(0.0))
-        ) \
-        .withColumn("distance_risk_score", 
-            when((col("distance_from_home_km") > 500) & (col("distance_from_home_km") != -1.0), 30).otherwise(0)
-        ) \
-        .withColumn("amount_risk_score",
-            when(col("amount_z_score") > 3.0, 40)
-            .when(col("amount_z_score") > 2.0, 20)
-            .otherwise(0)
-        ) \
-        .withColumn("velocity_risk_score",
-            when(col("trx_last_hour_cnt") > 5, 30)
-            .when(col("trx_last_hour_cnt") > 3, 15)
-            .otherwise(0)
-        ) \
-        .withColumn("fraud_score", 
-            col("distance_risk_score") + col("amount_risk_score") + col("velocity_risk_score")
-        ) \
-        .withColumn("is_fraud_alert", col("fraud_score") >= 60)
-        
-    # 8. Select final columns and write to target
-    final_output = scored_df.select(
-        "curr.trx_id", "curr.account_id", "curr.amount", 
-        "distance_from_home_km", "amount_z_score", "trx_last_hour_cnt", 
-        "fraud_score", "is_fraud_alert", lit(execution_date).alias("scoring_date")
-    )
-    
-    final_output.write \
-        .mode("append") \
-        .insertInto("fin_mart.fraud_scores_daily")
-    
-    print(f"Pure DataFrame Fraud scoring completed for {execution_date}")
+
+    query_job = client.query(query, job_config=job_config)
+    query_job.result() # Waits for the job to complete
+
+    print(f"BigQuery Fraud scoring completed for {execution_date}")
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: pyspark fin_credit_card_fraud_scoring.py <YYYY-MM-DD>")
+        print("Usage: python fin_credit_card_fraud_scoring_bq.py <YYYY-MM-DD>")
         sys.exit(1)
-        
+
     exec_date = sys.argv[1]
-    sp = create_spark_session()
-    
-    score_transactions_for_fraud(sp, exec_date)
-    sp.stop()
+    # Initialize BigQuery client; this replaces `create_spark_session()`
+    bq_client = bigquery.Client()
+
+    score_transactions_for_fraud(bq_client, exec_date)
+    # No explicit client `stop()` method needed for BigQuery
