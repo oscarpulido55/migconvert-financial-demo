@@ -4,10 +4,15 @@ from pyspark.sql.window import Window
 from pyspark.sql.types import StringType, DoubleType, IntegerType, StructType, StructField, ArrayType
 
 def get_spark_session():
-    """Initializes and returns a Spark session with Hive support enabled."""
+    """Initializes and returns a Spark session with BigQuery connector support.""" # Changed comment
+    # Replace 'your-gcp-project-id' and 'your-gcs-temp-bucket' with actual values.
+    # Ensure the Spark-BigQuery Connector JAR is available (e.g., via spark-submit --packages).
+    # For a list of available versions, see: https://repo1.maven.org/maven2/com/google/cloud/spark/spark-bigquery-with-dependencies_2.12/
     return SparkSession.builder \
         .appName("Financial_Customer_Onboarding_ETL") \
-        .enableHiveSupport() \
+        .config("spark.jars.packages", "com.google.cloud.spark:spark-bigquery-with-dependencies_2.12:0.29.0") \
+        .config("spark.hadoop.google.cloud.project.id", "your-gcp-project-id") \
+        .config("spark.temp.gcs.bucket", "your-gcs-temp-bucket") \
         .config("spark.sql.sources.partitionOverwriteMode", "dynamic") \
         .config("spark.sql.adaptive.enabled", "true") \
         .config("spark.sql.adaptive.coalescePartitions.enabled", "true") \
@@ -19,10 +24,11 @@ def process_customer_onboarding(spark):
     Reads raw customer data, KYC records, and initial funding details,
     performs complex transformations, and writes to the dimensions table.
     """
-    # 1. Read Raw Data sources (Simulated paths in HDFS)
-    raw_customers_df = spark.read.json("hdfs://namenode:8020/landing/fin/customers/")
-    raw_kyc_df = spark.read.parquet("hdfs://namenode:8020/landing/fin/kyc_status/")
-    raw_accounts_df = spark.read.csv("hdfs://namenode:8020/landing/fin/accounts/", header=True, inferSchema=True)
+    # 1. Read Raw Data sources (Simulated paths in GCS)
+    # Converted HDFS paths to GCS paths for BigQuery ecosystem compatibility.
+    raw_customers_df = spark.read.json("gs://your-gcs-bucket/landing/fin/customers/") # Converted HDFS path
+    raw_kyc_df = spark.read.parquet("gs://your-gcs-bucket/landing/fin/kyc_status/") # Converted HDFS path
+    raw_accounts_df = spark.read.csv("gs://your-gcs-bucket/landing/fin/accounts/", header=True, inferSchema=True) # Converted HDFS path
 
     # 2. Extract latest KYC status using Window Functions
     kyc_window = Window.partitionBy("customer_id").orderBy(col("verification_date").desc())
@@ -74,21 +80,27 @@ def process_customer_onboarding(spark):
         "onboarding_month", month(col("last_account_open_date"))
     )
 
-    # 6. Write to Managed Hive Table
-    # The target is fin_core.dim_customers partitioned by onboarding_year, onboarding_month, country_code
+    # 6. Write to BigQuery Table
+    # Converted write from Hive table to BigQuery table using the Spark-BigQuery connector.
+    # The 'partitionBy' (for Hive) is replaced with 'clusteringFields' for BigQuery,
+    # which offers similar performance benefits by organizing data for query efficiency.
+    # BigQuery table name format: `project_id.dataset_id.table_id`.
     final_dim_customers.write \
-        .partitionBy("onboarding_year", "onboarding_month", "country_code") \
-        .format("orc") \
+        .format("bigquery") \
+        .option("table", "your-gcp-project-id.fin_core.dim_customers") \
+        .option("clusteringFields", "onboarding_year,onboarding_month,country_code") \
         .mode("overwrite") \
-        .saveAsTable("fin_core.dim_customers")
+        .save() # Changed to .save()
 
     print(f"Successfully processed {final_dim_customers.count()} customer records.")
 
 if __name__ == "__main__":
     spark = get_spark_session()
-    
-    # Optional: Setup DB for the demo 
-    spark.sql("CREATE DATABASE IF NOT EXISTS fin_core")
-    
+
+    # Optional: Setup BigQuery dataset (equivalent to Hive database) for the demo.
+    # 'CREATE SCHEMA' is the BigQuery equivalent for creating a dataset.
+    # Ensure the 'your-gcp-project-id' is correctly set in get_spark_session().
+    spark.sql("CREATE SCHEMA IF NOT EXISTS fin_core") # Converted CREATE DATABASE to CREATE SCHEMA
+
     process_customer_onboarding(spark)
     spark.stop()
