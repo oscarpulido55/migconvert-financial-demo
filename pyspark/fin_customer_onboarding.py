@@ -1,134 +1,126 @@
-from google.cloud import bigquery # Converted from `from pyspark.sql import SparkSession`
-# PySpark functions replaced by BigQuery SQL equivalents within query strings (e.g., col, lit, current_timestamp, to_date, year, month, dayofmonth, max, sum, broadcast, when, coalesce, udf, array_contains, explode)
-# PySpark Window class is replaced by SQL window functions within query strings
-# PySpark SQL types (StringType, DoubleType, IntegerType, StructType, StructField, ArrayType) are handled by BigQuery's schema inference or explicit SQL DDL.
+```java
+import org.apache.spark.sql.Dataset;
+import org.apache.spark.sql.Row;
+import org.apache.spark.sql.SparkSession;
+import org.apache.spark.sql.functions;
+import org.apache.spark.sql.expressions.Window;
+import org.apache.spark.sql.Column;
 
-def get_bigquery_client(): # Converted from `get_spark_session`
-    """Initializes and returns a BigQuery client.""" # Converted docstring
-    return bigquery.Client() # Replaces `SparkSession.builder` and its chained methods.
-    # .appName("Financial_Customer_Onboarding_ETL") # Spark configuration, not applicable for BigQuery client
-    # .enableHiveSupport() # Spark-specific feature, not applicable
-    # .config("spark.sql.sources.partitionOverwriteMode", "dynamic") # Spark configuration, not applicable
-    # .config("spark.sql.adaptive.enabled", "true") # Spark configuration, not applicable
-    # .config("spark.sql.adaptive.coalescePartitions.enabled", "true") # Spark configuration, not applicable
-    # .getOrCreate() # Spark-specific, replaced by direct client instantiation
+public class FinancialCustomerOnboardingETL {
 
-def process_customer_onboarding(client): # `client` parameter instead of `spark`
-    """
-    Main ETL process for customer onboarding.
-    Reads raw customer data, KYC records, and initial funding details,
-    performs complex transformations, and writes to the dimensions table.
-    """
-    # 1. Source tables are assumed to be existing BigQuery tables or external tables on GCS.
-    # The original HDFS paths (e.g., "hdfs://namenode:8020/landing/fin/customers/")
-    # are mapped to BigQuery table references (project.dataset.table).
-    # Replace 'your-gcp-project-id' with your actual GCP Project ID.
-    raw_customers_df_ref = "`your-gcp-project-id.fin_core.raw_customers`" # BigQuery table reference for raw customer data
-    raw_kyc_df_ref = "`your-gcp-project-id.fin_core.raw_kyc`"             # BigQuery table reference for raw KYC data
-    raw_accounts_df_ref = "`your-gcp-project-id.fin_core.raw_accounts`"   # BigQuery table reference for raw account data
+    public static SparkSession getSparkSession() {
+        /**
+         * Initializes and returns a Spark session.
+         * For BigQuery integration, the 'spark-bigquery-with-dependencies' package is included.
+         * Ensure your Spark environment is configured for GCP authentication (e.g., via Google Cloud SDK,
+         * service account key JSON path, or workload identity).
+         */
+        return SparkSession.builder()
+            .appName("Financial_Customer_Onboarding_ETL")
+            // Configure BigQuery connector for Spark.
+            // Replace '0.29.1' with the appropriate version compatible with your Spark version.
+            .config("spark.jars.packages", "com.google.cloud.spark:spark-bigquery-with-dependencies_2.12:0.29.1")
+            // Generic Spark SQL optimizations
+            .config("spark.sql.sources.partitionOverwriteMode", "dynamic")
+            .config("spark.sql.adaptive.enabled", "true")
+            .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
+            .getOrCreate();
+    }
 
-    # 2. Extract latest KYC status - This logic is translated into a BigQuery SQL Common Table Expression (CTE).
-    # This CTE performs the equivalent of Spark's Window functions and filtering.
-    latest_kyc_cte_sql = f"""
-    latest_kyc AS (
-        SELECT
-            customer_id,
-            status AS kyc_status,
-            risk_rating AS kyc_risk_rating,
-            verification_date
-        FROM (
-            SELECT
-                customer_id,
-                status,
-                risk_rating,
-                verification_date,
-                ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY verification_date DESC) as rn
-            FROM {raw_kyc_df_ref}
-        )
-        WHERE rn = 1
-    )"""
+    public static void processCustomerOnboarding(SparkSession spark) {
+        /**
+         * Main ETL process for customer onboarding.
+         * Reads raw customer data, KYC records, and initial funding details from GCS,
+         * performs complex transformations, and writes to a BigQuery dimensions table.
+         */
+        // 1. Read Raw Data sources (Simulated paths in GCS)
+        // Replace '[YOUR_GCS_LANDING_BUCKET]' with your actual GCS bucket name.
+        Dataset<Row> rawCustomersDf = spark.read().json("gs://[YOUR_GCS_LANDING_BUCKET]/fin/customers/");
+        Dataset<Row> rawKycDf = spark.read().parquet("gs://[YOUR_GCS_LANDING_BUCKET]/fin/kyc_status/");
+        // For CSV, inferSchema should be explicitly handled or defined in Java if data quality is critical
+        Dataset<Row> rawAccountsDf = spark.read().option("header", "true").option("inferSchema", "true").csv("gs://[YOUR_GCS_LANDING_BUCKET]/fin/accounts/");
 
-    # 3. Aggregate Initial Funding - This logic is translated into a BigQuery SQL Common Table Expression (CTE).
-    # This CTE performs the equivalent of Spark's filter, groupBy, and agg functions.
-    funding_agg_cte_sql = f"""
-    funding_agg AS (
-        SELECT
-            customer_id,
-            SUM(initial_deposit) AS total_initial_deposit,
-            MAX(open_date) AS last_account_open_date
-        FROM {raw_accounts_df_ref}
-        WHERE account_status = 'ACTIVE'
-        GROUP BY customer_id
-    )"""
+        // 2. Extract latest KYC status using Window Functions
+        Window kycWindow = Window.partitionBy("customer_id").orderBy(functions.col("verification_date").desc());
+        Dataset<Row> latestKycDf = rawKycDf
+            .withColumn("row_num", functions.max("verification_date").over(kycWindow))
+            .filter(functions.col("verification_date").equalTo(functions.col("row_num")))
+            .drop("row_num")
+            .withColumnRenamed("status", "kyc_status")
+            .withColumnRenamed("risk_rating", "kyc_risk_rating");
 
-    # 4. Join and Enrich and 5. Complex Transformations (Calculate customer segments and risk profiles)
-    # These operations are combined into a single BigQuery SQL SELECT statement, joining the CTEs.
-    final_select_statement_sql = f"""
-    SELECT
-        c.customer_id,
-        c.first_name,
-        c.last_name,
-        c.ssn_hash AS national_id_hash,
-        c.dob AS date_of_birth,
-        c.address.country AS country_code,
-        c.address.state AS state_code,
-        COALESCE(k.kyc_status, 'PENDING') AS kyc_status,
-        COALESCE(k.kyc_risk_rating, 'UNKNOWN') AS risk_rating,
-        COALESCE(f.total_initial_deposit, 0.0) AS total_initial_deposit,
-        f.last_account_open_date,
-        CURRENT_TIMESTAMP() AS etl_insert_ts,
-        CASE
-            WHEN COALESCE(f.total_initial_deposit, 0.0) > 1000000 THEN 'PRIVATE_WEALTH'
-            WHEN (COALESCE(f.total_initial_deposit, 0.0) >= 100000) AND (COALESCE(f.total_initial_deposit, 0.0) <= 1000000) THEN 'PREMIUM'
-            WHEN k.kyc_status = 'REJECTED' THEN 'RESTRICTED'
-            ELSE 'RETAIL'
-        END AS customer_segment,
-        EXTRACT(YEAR FROM SAFE_CAST(f.last_account_open_date AS DATE)) AS onboarding_year,
-        EXTRACT(MONTH FROM SAFE_CAST(f.last_account_open_date AS DATE)) AS onboarding_month
-    FROM {raw_customers_df_ref} AS c
-    LEFT JOIN latest_kyc AS k ON c.customer_id = k.customer_id
-    LEFT JOIN funding_agg AS f ON c.customer_id = f.customer_id
-    """
+        // 3. Aggregate Initial Funding
+        Dataset<Row> fundingAggDf = rawAccountsDf
+            .filter(functions.col("account_status").equalTo("ACTIVE"))
+            .groupBy("customer_id")
+            .agg(
+                functions.sum("initial_deposit").as("total_initial_deposit"),
+                functions.max("open_date").as("last_account_open_date")
+            );
 
-    # 6. Write to Managed BigQuery Table
-    # The target is fin_core.dim_customers, partitioned by onboarding_year, onboarding_month, country_code.
-    # In BigQuery, CREATE OR REPLACE TABLE AS SELECT is used for overwrite.
-    # Partitioning is done using RANGE_BUCKET for integer year, and CLUSTER BY for month/country.
-    target_table_id = "`your-gcp-project-id.fin_core.dim_customers`"
+        // 4. Join and Enrich
+        // Broadcast join for smaller KYC dimension against larger Customers table
+        Dataset<Row> enrichedCustomerDf = rawCustomersDf.as("c")
+            .join(functions.broadcast(latestKycDf).as("k"), functions.col("c.customer_id").equalTo(functions.col("k.customer_id")), "left_outer")
+            .join(fundingAggDf.as("f"), functions.col("c.customer_id").equalTo(functions.col("f.customer_id")), "left_outer");
 
-    # Combined SQL query for table creation and data insertion with transformations.
-    final_bq_query = f"""
-    CREATE OR REPLACE TABLE {target_table_id}
-    PARTITION BY
-        RANGE_BUCKET(onboarding_year, GENERATE_ARRAY(2000, 2100, 1)) -- Partitions for integer year
-    CLUSTER BY onboarding_month, country_code -- Clustering for remaining partition keys
-    AS
-    WITH
-        {latest_kyc_cte_sql},
-        {funding_agg_cte_sql}
-    {final_select_statement_sql}
-    """
+        // 5. Complex Transformations: Calculate customer segments and risk profiles
+        Dataset<Row> finalDimCustomers = enrichedCustomerDf.select(
+            functions.col("c.customer_id"),
+            functions.col("c.first_name"),
+            functions.col("c.last_name"),
+            functions.col("c.ssn_hash").as("national_id_hash"),
+            functions.col("c.dob").as("date_of_birth"),
+            functions.col("c.address.country").as("country_code"),
+            functions.col("c.address.state").as("state_code"),
+            functions.coalesce(functions.col("k.kyc_status"), functions.lit("PENDING")).as("kyc_status"),
+            functions.coalesce(functions.col("k.kyc_risk_rating"), functions.lit("UNKNOWN")).as("risk_rating"),
+            functions.coalesce(functions.col("f.total_initial_deposit"), functions.lit(0.0)).as("total_initial_deposit"),
+            functions.col("f.last_account_open_date"),
+            functions.current_timestamp().as("etl_insert_ts")
+        ).withColumn(
+            "customer_segment",
+            functions.when(functions.col("total_initial_deposit").gt(1000000), "PRIVATE_WEALTH")
+                .when(functions.col("total_initial_deposit").geq(100000).and(functions.col("total_initial_deposit").leq(1000000)), "PREMIUM")
+                .when(functions.col("kyc_status").equalTo("REJECTED"), "RESTRICTED")
+                .otherwise("RETAIL")
+        ).withColumn(
+            "onboarding_year", functions.year(functions.col("last_account_open_date"))
+        ).withColumn(
+            "onboarding_month", functions.month(functions.col("last_account_open_date"))
+        );
 
-    client.query(final_bq_query).result() # Execute the BigQuery DDL/DML statement.
+        // 6. Write to BigQuery Table
+        // The target is [YOUR_GCP_PROJECT_ID].fin_core.dim_customers.
+        // BigQuery tables are partitioned differently than Hive. Ensure the target BigQuery table
+        // is pre-created with appropriate partitioning (e.g., by DATE column `onboarding_year`
+        // or `onboarding_month` if needed) or by ingestion time.
+        // The `partitionBy` method used in Hive for dynamic partition creation is not directly
+        // applicable here for BigQuery, as BigQuery partitioning is defined at table creation.
+        // These columns will exist in the dataset written to BigQuery.
+        // Replace '[YOUR_GCP_PROJECT_ID]' and '[YOUR_GCS_TEMP_BUCKET]' with actual values.
+        finalDimCustomers.write()
+            .format("bigquery")
+            .mode("overwrite")
+            .option("table", "[YOUR_GCP_PROJECT_ID].fin_core.dim_customers")
+            // A temporary GCS bucket is required by the BigQuery connector for staging data.
+            .option("temporaryGcsBucket", "[YOUR_GCS_TEMP_BUCKET]")
+            .save();
 
-    # To replicate the log message's functional behavior (counting processed records).
-    # Spark's count() is on DataFrame; BigQuery needs a separate query on the result table.
-    count_query = f"SELECT count(*) FROM {target_table_id}"
-    count_job = client.query(count_query)
-    record_count = count_job.result().to_dataframe().iloc[0, 0] # Fetches the first (and only) count result.
-    print(f"Successfully processed {record_count} customer records.")
+        System.out.println(String.format("Successfully processed %d customer records.", finalDimCustomers.count()));
+    }
 
-if __name__ == "__main__":
-    client = get_bigquery_client()
+    public static void main(String[] args) {
+        SparkSession spark = getSparkSession();
 
-    # Optional: Setup DB for the demo
-    # spark.sql("CREATE DATABASE IF NOT EXISTS fin_core")
-    # BigQuery equivalent: CREATE SCHEMA IF NOT EXISTS <project_id>.fin_core
-    # Using client.project for project_id and 'fin_core' as the dataset name.
-    project_id_from_client = client.project # Get default project ID
-    dataset_name = "fin_core"
-    create_dataset_sql = f"CREATE SCHEMA IF NOT EXISTS `{project_id_from_client}.{dataset_name}` OPTIONS(location='US')"
-    client.query(create_dataset_sql).result()
+        // Optional: Setup BigQuery dataset (equivalent to Hive database) for the demo
+        // BigQuery uses datasets. The full dataset identifier includes the project ID.
+        // Replace '[YOUR_GCP_PROJECT_ID]' with your actual GCP Project ID.
+        // Note: CREATE SCHEMA is typically used in Spark 3.x for dataset/namespace operations.
+        spark.sql("CREATE SCHEMA IF NOT EXISTS `[YOUR_GCP_PROJECT_ID]`.fin_core");
 
-    process_customer_onboarding(client)
-    # spark.stop() is a Spark-specific resource management call; not applicable to stateless BigQuery client.
+        processCustomerOnboarding(spark);
+        spark.stop();
+    }
+}
+```

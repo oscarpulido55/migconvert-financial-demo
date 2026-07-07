@@ -17,8 +17,8 @@ CREATE TABLE IF NOT EXISTS fin_core.dim_customers_scd2 (
     marital_status STRING,
     effective_start_date TIMESTAMP,
     effective_end_date TIMESTAMP,
-    is_active BOOL
-); -- Removed STORED AS ORC; STRING and TIMESTAMP types are compatible, BOOL is BigQuery equivalent for BOOLEAN.
+    is_active BOOL -- Converted Hive's BOOLEAN to BigQuery's BOOL
+); -- Removed Hive-specific 'STORED AS ORC' clause, as BigQuery handles storage format automatically.
 
 -- View logic to do an SCD 2 transform over yesterday's active snapshot vs today's delta update
 DROP VIEW IF EXISTS default.vw_scd_transform_stg;
@@ -43,7 +43,7 @@ incoming_updates AS (
     FROM (
         SELECT *, ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY timestamp DESC) as rn
         FROM fin_landing.customer_updates
-        WHERE CAST(timestamp AS DATE) = '2024-01-01' -- Converted Hive-specific to_date() to BigQuery CAST(... AS DATE)
+        WHERE DATE(timestamp) = '2024-01-01' -- Converted Hive's to_date(timestamp) to BigQuery's DATE(timestamp)
     ) t WHERE rn = 1
 )
 
@@ -86,7 +86,7 @@ FROM incoming_updates i
 FULL OUTER JOIN active_records a ON i.customer_id = a.customer_id;
 
 -- 1. Insert the retired rows (closing the effective_end_date and setting is_active = false)
-INSERT INTO fin_core.dim_customers_scd2 ( -- Removed 'TABLE' keyword.
+INSERT INTO fin_core.dim_customers_scd2 ( -- Removed Hive-specific 'TABLE' keyword; added explicit column list for clarity
     customer_surrogate_key,
     customer_id,
     first_name,
@@ -115,7 +115,7 @@ FROM default.vw_scd_transform_stg
 WHERE change_type = 'UPDATE';
 
 -- 2. Insert the completely NEW rows, and the NEW ACTIVE instances of updated rows
-INSERT INTO fin_core.dim_customers_scd2 ( -- Removed 'TABLE' keyword.
+INSERT INTO fin_core.dim_customers_scd2 ( -- Removed Hive-specific 'TABLE' keyword; added explicit column list for clarity
     customer_surrogate_key,
     customer_id,
     first_name,
@@ -130,7 +130,7 @@ INSERT INTO fin_core.dim_customers_scd2 ( -- Removed 'TABLE' keyword.
 )
 SELECT
     -- Generate new Surrogate Key (UUID)
-    GENERATE_UUID() AS customer_surrogate_key, -- Replaced Hive reflect() with BigQuery GENERATE_UUID()
+    GENERATE_UUID() AS customer_surrogate_key, -- Converted Hive's reflect UDF for UUID generation to BigQuery's GENERATE_UUID()
     customer_id,
     first_name_new,
     last_name_new,
