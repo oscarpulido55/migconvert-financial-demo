@@ -1,16 +1,21 @@
+import os
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, lit, current_timestamp, to_date, year, month, dayofmonth, max as spark_max, sum as spark_sum, broadcast, when, coalesce, udf, array_contains, explode
 from pyspark.sql.window import Window
 from pyspark.sql.types import StringType, DoubleType, IntegerType, StructType, StructField, ArrayType
 
 def get_spark_session():
-    """Initializes and returns a Spark session with Hive support enabled."""
+    """Initializes and returns a Spark session with BigQuery connector enabled."""
     return SparkSession.builder \
         .appName("Financial_Customer_Onboarding_ETL") \
-        .enableHiveSupport() \
+        .config("spark.jars.packages", "com.google.cloud.spark:spark-bigquery-with-dependencies_2.12:0.29.0") \
+        .config("spark.cloud.google.project.id", os.environ.get("GCP_PROJECT_ID", "your-gcp-project-id")) \
+        .config("spark.hadoop.google.cloud.auth.service.account.enable", "true") \
+        .config("spark.hadoop.google.cloud.auth.service.account.json.keyfile", os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "/path/to/your/service-account-key.json")) \
         .config("spark.sql.sources.partitionOverwriteMode", "dynamic") \
         .config("spark.sql.adaptive.enabled", "true") \
         .config("spark.sql.adaptive.coalescePartitions.enabled", "true") \
+        .config("spark.datasource.bigquery.temporaryGcsBucket", os.environ.get("GCS_TEMP_BUCKET", "your-gcs-temp-bucket")) \
         .getOrCreate()
 
 def process_customer_onboarding(spark):
@@ -19,10 +24,10 @@ def process_customer_onboarding(spark):
     Reads raw customer data, KYC records, and initial funding details,
     performs complex transformations, and writes to the dimensions table.
     """
-    # 1. Read Raw Data sources (Simulated paths in HDFS)
-    raw_customers_df = spark.read.json("hdfs://namenode:8020/landing/fin/customers/")
-    raw_kyc_df = spark.read.parquet("hdfs://namenode:8020/landing/fin/kyc_status/")
-    raw_accounts_df = spark.read.csv("hdfs://namenode:8020/landing/fin/accounts/", header=True, inferSchema=True)
+    # 1. Read Raw Data sources (Simulated paths in GCS)
+    raw_customers_df = spark.read.json("gs://your-gcs-landing-bucket/fin/customers/")
+    raw_kyc_df = spark.read.parquet("gs://your-gcs-landing-bucket/fin/kyc_status/")
+    raw_accounts_df = spark.read.csv("gs://your-gcs-landing-bucket/fin/accounts/", header=True, inferSchema=True)
 
     # 2. Extract latest KYC status using Window Functions
     kyc_window = Window.partitionBy("customer_id").orderBy(col("verification_date").desc())
@@ -74,21 +79,21 @@ def process_customer_onboarding(spark):
         "onboarding_month", month(col("last_account_open_date"))
     )
 
-    # 6. Write to Managed Hive Table
-    # The target is fin_core.dim_customers partitioned by onboarding_year, onboarding_month, country_code
+    # 6. Write to BigQuery Table
     final_dim_customers.write \
-        .partitionBy("onboarding_year", "onboarding_month", "country_code") \
-        .format("orc") \
+        .format("bigquery") \
+        .option("table", f"{os.environ.get('GCP_PROJECT_ID', 'your-gcp-project-id')}.fin_core.dim_customers") \
+        .option("writeDisposition", "WRITE_TRUNCATE") \
         .mode("overwrite") \
-        .saveAsTable("fin_core.dim_customers")
+        .save()
 
     print(f"Successfully processed {final_dim_customers.count()} customer records.")
 
 if __name__ == "__main__":
     spark = get_spark_session()
-    
-    # Optional: Setup DB for the demo 
-    spark.sql("CREATE DATABASE IF NOT EXISTS fin_core")
-    
+
+    # Optional: Setup BigQuery dataset (schema) for the demo
+    spark.sql(f"CREATE SCHEMA IF NOT EXISTS `{os.environ.get('GCP_PROJECT_ID', 'your-gcp-project-id')}.fin_core`")
+
     process_customer_onboarding(spark)
     spark.stop()
