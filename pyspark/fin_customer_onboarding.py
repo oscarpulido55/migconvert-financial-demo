@@ -86,9 +86,16 @@ def process_customer_onboarding(spark):
 
 if __name__ == "__main__":
     spark = get_spark_session()
-    
-    # Optional: Setup DB for the demo 
-    spark.sql("CREATE DATABASE IF NOT EXISTS fin_core")
-    
+
+    # Optional: Setup DB for the demo
+    spark.sql("-- Translation time: 2026-08-05T20:28:40.205784Z
+-- Translation job ID: fb508b32-1a13-4241-983a-d46f0491aeab
+-- Source: gs://migconvert-at-next26-work-bkt/384_SQL_TRANSLATION_ID_input/384_SQL_TRANSLATION_ID.sql
+-- Translated from: Hive
+-- Translated to: BigQuery
+
+CREATE SCHEMA fin_core;
+")
+
     process_customer_onboarding(spark)
     spark.stop()
