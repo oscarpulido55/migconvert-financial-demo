@@ -1,33 +1,22 @@
 import sys
 import math
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, udf, lit, unix_timestamp, count, avg, stddev_samp, when, date_sub
+from pyspark.sql import functions as F
+from pyspark.sql.functions import col, udf, lit, count, avg, stddev_samp, when
 from pyspark.sql.types import DoubleType, IntegerType, StringType
 from pyspark.sql.window import Window
 
-# Define a placeholder for your GCP Project ID.
-# This variable is required for specifying BigQuery tables. Replace "your-gcp-project-id" with your actual GCP Project ID.
-GCP_PROJECT_ID = "your-gcp-project-id"
-
 def create_spark_session():
-    """Initializes and returns a Spark session configured for BigQuery."""
-    # Removed .enableHiveSupport() as it's HiveQL specific.
-    # Added configuration for the Spark-BigQuery connector.
-    # The 'spark.jars.packages' config downloads the necessary BigQuery connector JARs.
-    # The version '0.28.0' is an example, ensure it's compatible with your Spark version.
-    # Authentication to BigQuery typically relies on Google Application Credentials set in the environment,
-    # or GCE/GKE workload identity; explicit credentials are not configured here but can be added via options.
+    """Initializes and returns a Spark session."""
     return SparkSession.builder \
-        .appName("Financial_Credit_Card_Fraud_Scoring_BigQuery") \
-        .config("spark.jars.packages", "com.google.cloud.spark:spark-bigquery-with-dependencies_2.12:0.28.0") \
+        .appName("Financial_Credit_Card_Fraud_Scoring") \
         .getOrCreate()
 
-# Create a custom UDF for great circle distance
 def haversine(lat1, lon1, lat2, lon2):
     """Calculates the great circle distance between two points on the earth."""
     if lat1 is None or lon1 is None or lat2 is None or lon2 is None:
         return -1.0
-    R = 6371.0 # Radius of earth in km
+    R = 6371.0
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
     dphi = math.radians(lat2 - lat1)
     dlambda = math.radians(lon2 - lon1)
@@ -42,12 +31,13 @@ def score_transactions_for_fraud(spark, execution_date):
     Replaces embedded SQL with continuous DataFrame transformations.
     """
 
-    # 1. Load Data from BigQuery
-    # Replaced spark.table("db.table") with spark.read.format("bigquery").option("table", "project.dataset.table").load()
-    # to explicitly connect to BigQuery. The GCP_PROJECT_ID is used to form the full table path.
-    full_cc_trx = spark.read.format("bigquery").option("table", f"{GCP_PROJECT_ID}.fin_core.cc_transactions").load()
-    accounts = spark.read.format("bigquery").option("table", f"{GCP_PROJECT_ID}.fin_core.dim_accounts").load()
-    merchants = spark.read.format("bigquery").option("table", f"{GCP_PROJECT_ID}.fin_core.dim_merchants").load()
+    # 1. Load Data
+    # Converted spark.table() to BigQuery connector read as per task t2 & t3
+    full_cc_trx = spark.read.format("bigquery").option("table", "your_project_id.fin_core.cc_transactions").load()
+    # Converted spark.table() to BigQuery connector read as per task t4 & t5
+    accounts = spark.read.format("bigquery").option("table", "your_project_id.fin_core.dim_accounts").load()
+    # Converted spark.table() to BigQuery connector read as per task t6 & t7
+    merchants = spark.read.format("bigquery").option("table", "your_project_id.fin_core.dim_merchants").load()
 
     # 2. Extract current day transactions
     cc_trx = full_cc_trx.filter(col("trx_date") == execution_date)
@@ -64,8 +54,9 @@ def score_transactions_for_fraud(spark, execution_date):
     # 4. Pure DataFrame Historical Profiling Window
     # Filter for the last 90 days of transactions (excluding execution date)
     hist_trx = full_cc_trx.filter(
-        (col("trx_date") >= date_sub(lit(execution_date), 90)) &
-        (col("trx_date") <= date_sub(lit(execution_date), 1))
+        # Translated date_sub to BigQuery compatible F.expr as per task t8
+        (col("trx_date") >= F.expr(f"DATE_SUB(CAST('{execution_date}' AS DATE), INTERVAL 90 DAY)")) &
+        (col("trx_date") <= F.expr(f"DATE_SUB(CAST('{execution_date}' AS DATE), INTERVAL 1 DAY)"))
     )
 
     # Aggregate to build the historical profile
@@ -80,7 +71,8 @@ def score_transactions_for_fraud(spark, execution_date):
         .join(hist_profile.alias("hist"), col("curr.account_id") == col("hist.account_id"), "left")
 
     # 6. Apply Time-based Window Function (Last Hour Trx Count)
-    time_window = Window.partitionBy("curr.account_id").orderBy(unix_timestamp("curr.trx_timestamp")).rangeBetween(-3600, 0)
+    # Converted unix_timestamp to F.expr("UNIX_SECONDS(column)") for BigQuery as per task t9
+    time_window = Window.partitionBy("curr.account_id").orderBy(F.expr("UNIX_SECONDS(curr.trx_timestamp)")).rangeBetween(-3600, 0)
 
     # 7. Apply Complex Business Logic and Scoring Native DataFrame API
     scored_df = df_features \
@@ -115,11 +107,10 @@ def score_transactions_for_fraud(spark, execution_date):
         "fraud_score", "is_fraud_alert", lit(execution_date).alias("scoring_date")
     )
 
-    # Replaced .insertInto("db.table") with .write.format("bigquery").option("table", "project.dataset.table").mode("append").save()
-    # for writing data directly to BigQuery using the connector.
+    # Replaced insertInto with BigQuery connector write as per task t10 & t11
     final_output.write \
         .format("bigquery") \
-        .option("table", f"{GCP_PROJECT_ID}.fin_mart.fraud_scores_daily") \
+        .option("table", "your_project_id.fin_mart.fraud_scores_daily") \
         .mode("append") \
         .save()
 
