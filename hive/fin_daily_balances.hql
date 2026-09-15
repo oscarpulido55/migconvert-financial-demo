@@ -1,6 +1,6 @@
--- Translation time: 2026-08-05T20:28:40.531715Z
--- Translation job ID: 1e3acb40-376b-497b-9db2-80c4819373d4
--- Source: gs://migconvert-at-next26-work-bkt/auto_convert_20260805_202829_a824/convert_20260805_202829/bq_translation/385_SQL_TRANSLATION_ID_input/385_SQL_TRANSLATION_ID.sql
+-- Translation time: 2026-09-15T19:44:33.643074Z
+-- Translation job ID: 6e30c37b-3e0d-426e-89c2-da70bebed3c8
+-- Source: gs://migconvert-at-next26-work-bkt/auto_convert_20260915_194422_a195/convert_20260915_194422/bq_translation/749_SQL_TRANSLATION_ID_input/749_SQL_TRANSLATION_ID.sql
 -- Translated from: Hive
 -- Translated to: BigQuery
 
@@ -134,7 +134,7 @@ ON (fact_daily_balances.balance_date IN UNNEST(balance_date__values)
  AND fact_daily_balances.region_code IS NOT DISTINCT FROM fact_daily_balances__insert.region_code
    WHEN MATCHED THEN DELETE
 ;
-INSERT INTO __DEFAULT_DATABASE__.fin_core.fact_daily_balances (account_id, customer_id, account_type, open_date, currency_code, beginning_balance, total_credits, total_debits, ending_balance, interest_accrued, is_overdrawn, etl_timestamp, balance_date, region_code)
+INSERT INTO __DEFAULT_DATABASE__.fin_core.fact_daily_balances
   SELECT
       fact_daily_balances__insert.account_id,
       fact_daily_balances__insert.customer_id,

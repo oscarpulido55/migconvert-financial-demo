@@ -23,10 +23,9 @@ class AlgorithmicTradingPerformance:
     def execute_pipeline(self, spark: SparkSession, run_date: str):
 
         # 1. Load Core Datasets
-        # Convert HDFS Parquet read paths to BigQuery table references
-        all_order_events_df = spark.read.format('bigquery').option('table', 'bigquery_project.bigquery_dataset.trading_events_base').load()
-        # Convert HDFS Parquet read paths to BigQuery table references
-        parent_orders_df = spark.read.format('bigquery').option('table', 'bigquery_project.bigquery_dataset.parent_orders').load()
+        # HDFS paths are converted to Google Cloud Storage (GCS) paths for BigQuery environment compatibility.
+        all_order_events_df = spark.read.parquet("gs://your_gcs_bucket/trading_events_base/")
+        parent_orders_df = spark.read.parquet("gs://your_gcs_bucket/parent_orders/")
 
         # 2. Separate Event Stream into Fills
         # Anonymized protocol filtering conceptually representing status flags
@@ -104,32 +103,23 @@ class AlgorithmicTradingPerformance:
         )
 
         # 6. Market Data Tick Metrics (complex time-based joins)
-        # Convert HDFS Parquet read paths to BigQuery table references
-        quotes_df = spark.read.format('bigquery').option('table', 'bigquery_project.bigquery_dataset.level1_quotes').load()
+        # HDFS paths are converted to Google Cloud Storage (GCS) paths for BigQuery environment compatibility.
+        quotes_df = spark.read.parquet("gs://your_gcs_bucket/level1_quotes/")
 
-        # Removed PySpark repartitioning and sortWithinPartitions calls.
-        # BigQuery's serverless architecture and native optimizations handle data distribution differently,
-        # often making these explicit PySpark calls unnecessary or less effective.
-        # quotes_df = quotes_df.repartition("ticker").sortWithinPartitions("quote_timestamp")
-        # enriched_orders_df = enriched_orders_df.repartition("ticker").sortWithinPartitions("EffectiveStartTime")
+        quotes_df = quotes_df.repartition("ticker").sortWithinPartitions("quote_timestamp")
+        enriched_orders_df = enriched_orders_df.repartition("ticker").sortWithinPartitions("EffectiveStartTime")
 
         quotes_df = quotes_df.withColumn("quote_pk", F.monotonically_increasing_id())
         enriched_orders_df = enriched_orders_df.withColumn("order_pk", F.monotonically_increasing_id())
 
         # Build Window buffers for Quote lookups
         enriched_orders_df = (enriched_orders_df
-            # Rewritten Spark SQL interval expressions to BigQuery compatible TIMESTAMP_SUB syntax.
-            .withColumn("Start_lower", F.expr(f"TIMESTAMP_SUB(EffectiveStartTime, INTERVAL 10 MINUTE)"))
-            # Rewritten Spark SQL interval expressions to BigQuery compatible TIMESTAMP_SUB syntax.
-            .withColumn("End_lower", F.expr(f"TIMESTAMP_SUB(EffectiveEndTime, INTERVAL 10 MINUTE)"))
-            # Rewritten Spark SQL interval expressions to BigQuery compatible TIMESTAMP_ADD syntax.
-            .withColumn("End_plus1", F.expr(f"TIMESTAMP_ADD(EffectiveEndTime, INTERVAL 1 MINUTE)"))
-            # Rewritten Spark SQL interval expressions to BigQuery compatible TIMESTAMP_SUB syntax.
-            .withColumn("End_plus1_lower", F.expr(f"TIMESTAMP_SUB(End_plus1, INTERVAL 10 MINUTE)"))
-            # Rewritten Spark SQL interval expressions to BigQuery compatible TIMESTAMP_ADD syntax.
-            .withColumn("End_plus5", F.expr(f"TIMESTAMP_ADD(EffectiveEndTime, INTERVAL 5 MINUTE)"))
-            # Rewritten Spark SQL interval expressions to BigQuery compatible TIMESTAMP_SUB syntax.
-            .withColumn("End_plus5_lower", F.expr(f"TIMESTAMP_SUB(End_plus5, INTERVAL 10 MINUTE)"))
+            .withColumn("Start_lower", F.expr(f"EffectiveStartTime - interval 10 minutes"))
+            .withColumn("End_lower", F.expr(f"EffectiveEndTime - interval 10 minutes"))
+            .withColumn("End_plus1", F.expr(f"EffectiveEndTime + interval 1 minutes"))
+            .withColumn("End_plus1_lower", F.expr(f"End_plus1 - interval 10 minutes"))
+            .withColumn("End_plus5", F.expr(f"EffectiveEndTime + interval 5 minutes"))
+            .withColumn("End_plus5_lower", F.expr(f"End_plus5 - interval 10 minutes"))
         )
 
         # Define a closure to reuse logic for looking up the nearest quote
@@ -137,8 +127,7 @@ class AlgorithmicTradingPerformance:
             join_cond = (orders_df["ticker"] == quotes_df["ticker"]) & (F.col("quote_timestamp").between(F.col(lower_bound_col), F.col(target_time_col)))
 
             joined = (orders_df.join(quotes_df, join_cond, how="inner")
-                        # Removed Spark-specific optimization hint as it is not applicable in BigQuery.
-                        # .hint("merge")
+                        .hint("merge") # Spark hint retained; might be optimized differently or ignored by underlying BigQuery connector.
                         .withColumn("time_diff", F.abs(F.col(target_time_col) - F.col("quote_timestamp"))))
 
             nearest = (joined
@@ -157,8 +146,8 @@ class AlgorithmicTradingPerformance:
         end_1m_quotes = find_nearest_quote(enriched_orders_df, quotes_df, "End_plus1", "End_plus1_lower", "end_plus1")
 
         # 7. Core VWAP and Financial Performance calculations
-        # Convert HDFS Parquet read paths to BigQuery table references
-        trades_df = spark.read.format('bigquery').option('table', 'bigquery_project.bigquery_dataset.market_trades').load()
+        # HDFS paths are converted to Google Cloud Storage (GCS) paths for BigQuery environment compatibility.
+        trades_df = spark.read.parquet("gs://your_gcs_bucket/market_trades/")
 
         # VWAP during order existence
         vwap_df = (enriched_orders_df
@@ -206,10 +195,8 @@ class AlgorithmicTradingPerformance:
              .when(F.col("side") == "SELL", (F.col("requested_shares") - F.col("fill_TotalSharesExecuted")) * (F.col("closing_price") - F.col("fill_AverageExecutionPrice")))
         )
 
-        # Changed output sink from HDFS Parquet to a BigQuery table.
-        # Consider adding a 'partitionBy' clause if 'run_date' should be used for BigQuery table partitioning,
-        # but as 'run_date' is currently a path component, it would need to be added as a DataFrame column first.
-        final_df.write.format('bigquery').option('table', 'bigquery_project.bigquery_dataset.trading_analytics').mode("overwrite").save()
+        # HDFS write path is converted to Google Cloud Storage (GCS) path for BigQuery environment compatibility.
+        final_df.write.parquet(f"gs://your_gcs_bucket/trading_analytics/run_date={run_date}", mode="overwrite")
         print("Performance analysis complete.")
 
 if __name__ == "__main__":

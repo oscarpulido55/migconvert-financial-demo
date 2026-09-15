@@ -1,6 +1,6 @@
--- Translation time: 2026-08-05T20:28:39.307982Z
--- Translation job ID: 275fe105-e17b-4c28-84fe-c27e41f77e8b
--- Source: gs://migconvert-at-next26-work-bkt/auto_convert_20260805_202829_a824/convert_20260805_202829/bq_translation/164_SQL_TRANSLATION_ID_input/164_SQL_TRANSLATION_ID.sql
+-- Translation time: 2026-09-15T19:44:33.529103Z
+-- Translation job ID: f49011ef-941e-4996-826f-2a94ad17c4de
+-- Source: gs://migconvert-at-next26-work-bkt/auto_convert_20260915_194422_a195/convert_20260915_194422/bq_translation/288_SQL_TRANSLATION_ID_input/288_SQL_TRANSLATION_ID.sql
 -- Translated from: Hive
 -- Translated to: BigQuery
 
@@ -109,7 +109,7 @@ SELECT
     FULL OUTER JOIN active_records AS a ON i.customer_id = a.customer_id
 ;
 -- 1. Insert the retired rows (closing the effective_end_date and setting is_active = false)
-INSERT INTO __DEFAULT_DATABASE__.fin_core.dim_customers_scd2 (customer_surrogate_key, customer_id, first_name, last_name, email_address, phone_number, residential_address, marital_status, effective_start_date, effective_end_date, is_active)
+INSERT INTO __DEFAULT_DATABASE__.fin_core.dim_customers_scd2
   SELECT
       old_sk,
       customer_id,
@@ -127,7 +127,7 @@ INSERT INTO __DEFAULT_DATABASE__.fin_core.dim_customers_scd2 (customer_surrogate
     WHERE change_type = 'UPDATE'
 ;
 -- 2. Insert the completely NEW rows, and the NEW ACTIVE instances of updated rows
-INSERT INTO __DEFAULT_DATABASE__.fin_core.dim_customers_scd2 (customer_surrogate_key, customer_id, first_name, last_name, email_address, phone_number, residential_address, marital_status, effective_start_date, effective_end_date, is_active)
+INSERT INTO __DEFAULT_DATABASE__.fin_core.dim_customers_scd2
   SELECT
       -- Generate new Surrogate Key (UUID)
       reflect('java.util.UUID', 'randomUUID') AS customer_surrogate_key,

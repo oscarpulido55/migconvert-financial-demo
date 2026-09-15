@@ -88,9 +88,9 @@ if __name__ == "__main__":
     spark = get_spark_session()
 
     # Optional: Setup DB for the demo
-    spark.sql("-- Translation time: 2026-08-05T20:28:40.205784Z
--- Translation job ID: fb508b32-1a13-4241-983a-d46f0491aeab
--- Source: gs://migconvert-at-next26-work-bkt/384_SQL_TRANSLATION_ID_input/384_SQL_TRANSLATION_ID.sql
+    spark.sql("-- Translation time: 2026-09-15T19:44:34.815406Z
+-- Translation job ID: b697bdbe-e17e-466d-87ac-0ef4b61c45d3
+-- Source: gs://migconvert-at-next26-work-bkt/832_SQL_TRANSLATION_ID_input/832_SQL_TRANSLATION_ID.sql
 -- Translated from: Hive
 -- Translated to: BigQuery
 
